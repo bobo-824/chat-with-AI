@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>AI Chat</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="stylesheet" href="/style.css">
+  <meta name="theme-color" content="#ffffff">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+</head>
+<body>
+  <div class="login-screen" id="login-screen" hidden>
+    <form class="login-card" id="login-form">
+      <div class="hero-mark">A</div>
+      <h1>登录 AI Chat</h1>
+      <p>请输入服务端设置的访问密码。</p>
+      <label class="field"><span>访问密码</span><input id="login-password" type="password" autocomplete="current-password" required autofocus></label>
+      <p class="form-error" id="login-error" role="alert"></p>
+      <button class="primary-button login-button" type="submit">登录</button>
+    </form>
+  </div>
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-header">
+        <a class="brand" href="/" aria-label="AI Chat 首页"><span class="brand-mark">A</span><span>AI Chat</span></a>
+        <button class="icon-button sidebar-close" id="sidebar-close" type="button" aria-label="关闭侧边栏"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button>
+      </div>
+      <button class="new-chat-button" id="new-chat" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg><span>新对话</span></button>
+      <div class="history-section"><p class="section-label">历史对话</p><nav class="conversation-list" id="conversation-list" aria-label="历史对话"></nav></div>
+      <div class="sidebar-footer">
+        <button class="sidebar-action" id="settings" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.83 2.83-.06-.06a1.7 1.7 0 0 0-1.88-.34A1.7 1.7 0 0 0 14 20.93V21h-4v-.08A1.7 1.7 0 0 0 8.94 19.4a1.7 1.7 0 0 0-1.88.34L7 19.8 4.2 17l.06-.06A1.7 1.7 0 0 0 4.6 15 1.7 1.7 0 0 0 3.07 14H3v-4h.08A1.7 1.7 0 0 0 4.6 8.94a1.7 1.7 0 0 0-.34-1.88L4.2 7 7 4.2l.06.06A1.7 1.7 0 0 0 8.94 4.6 1.7 1.7 0 0 0 10 3.07V3h4v.08a1.7 1.7 0 0 0 1.03 1.52 1.7 1.7 0 0 0 1.88-.34l.06-.06L19.8 7l-.06.06a1.7 1.7 0 0 0-.34 1.88A1.7 1.7 0 0 0 20.93 10H21v4h-.08A1.7 1.7 0 0 0 19.4 15Z"/></svg><span>连接设置</span></button>
+        <button class="sidebar-action" id="logout" type="button" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 17l5-5-5-5M15 12H3M14 4h5a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-5"/></svg><span>退出登录</span></button>
+      </div>
+    </aside>
+    <button class="sidebar-backdrop" id="sidebar-backdrop" type="button" aria-label="关闭侧边栏"></button>
+
+    <main class="workspace">
+      <header class="topbar">
+        <button class="icon-button menu-button" id="menu-button" type="button" aria-label="打开侧边栏"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+        <div class="model-picker"><select id="model" aria-label="选择模型"></select><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 10 4 4 4-4"/></svg></div>
+        <button class="ghost-button" id="clear" type="button" title="开始空白对话">清空</button>
+      </header>
+
+      <section class="chat-scroll" id="chat-scroll">
+        <div class="empty-state" id="empty-state">
+          <div class="hero-mark">A</div><h1>有什么可以帮忙的？</h1><p>选择一个模型，然后开始对话。</p>
+          <div class="suggestion-grid">
+            <button class="suggestion" type="button" data-prompt="帮我制定一个高效的学习计划"><strong>制定计划</strong><span>帮我安排学习或工作</span></button>
+            <button class="suggestion" type="button" data-prompt="解释一个我不理解的概念"><strong>解释概念</strong><span>用简单语言讲清楚</span></button>
+            <button class="suggestion" type="button" data-prompt="帮我润色下面这段文字："><strong>润色文字</strong><span>改进表达和结构</span></button>
+            <button class="suggestion" type="button" data-prompt="和我一起头脑风暴一个新项目"><strong>头脑风暴</strong><span>探索创意和可能性</span></button>
+          </div>
+        </div>
+        <div class="messages" id="messages" aria-live="polite"></div>
+      </section>
+
+      <div class="composer-area">
+        <form id="composer" class="composer"><textarea id="input" rows="1" placeholder="给 AI Chat 发送消息" aria-label="消息" required></textarea><button class="send-button" type="submit" aria-label="发送消息"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M6.5 10.5 12 5l5.5 5.5"/></svg></button></form>
+        <p class="chat-status" id="chat-status" role="status" aria-live="polite"></p>
+        <p class="disclaimer">AI 可能会犯错，请核查重要信息。</p>
+      </div>
+    </main>
+  </div>
+
+  <dialog id="config-dialog" class="config-dialog">
+    <form class="dialog-body" id="config-form">
+      <div class="dialog-heading"><div><h2>连接设置</h2><p>配置你的 API 中转站与可用模型。</p></div><button class="icon-button" type="button" id="config-close" aria-label="关闭"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
+      <label class="field"><span>API URL</span><input id="base-url" type="url" placeholder="https://relay.example.com/v1" autocomplete="off" required></label>
+      <label class="field"><span>API Key</span><div class="secret-input"><input id="api-key" type="password" placeholder="sk-..." autocomplete="off"><button id="api-key-reveal" type="button" aria-label="显示 API Key">显示</button></div><small>已保存的 Key 可留空。只有点击“显示”时，Key 才会读取到当前页面。</small></label>
+      <label class="field"><span>常用模型</span><select id="common-model"><option value="">选择一个常用模型（可选）</option><option value="gpt-4o">GPT-4o</option><option value="gpt-4o-mini">GPT-4o mini</option><option value="gpt-4.1">GPT-4.1</option><option value="gpt-4.1-mini">GPT-4.1 mini</option><option value="claude-3-7-sonnet-latest">Claude 3.7 Sonnet</option><option value="gemini-2.5-pro">Gemini 2.5 Pro</option><option value="deepseek-chat">DeepSeek Chat</option><option value="qwen-plus">Qwen Plus</option><option value="glm-4.5">GLM-4.5</option></select></label>
+      <label class="field"><span>自定义模型名称</span><input id="models" placeholder="model-a, model-b（可选）" autocomplete="off"><small>中转站无法返回模型列表时，可手动填写多个模型。常用模型也可以与自定义名称一起使用。</small></label>
+      <p class="form-error" id="config-error" role="alert"></p>
+      <div class="dialog-actions"><button class="secondary-button" type="button" id="config-cancel">取消</button><button class="primary-button" type="submit">保存并连接</button></div>
+    </form>
+  </dialog>
+  <script src="/app.js" defer></script>
+</body>
+</html>

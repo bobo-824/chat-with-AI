@@ -1,0 +1,39 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+app-config.json
+app-secret.json
+*.secret.json
+
+# Conversation data
+chat-history.json
+
+# Atomic-write temporary files (.<target>.<uuid>.tmp)
+*.tmp
+
+# Python bytecode and tool caches
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Test artifacts (mock relay stores and throwaway configuration)
+tests/.history-*.json
+tests/.relay-history-*.json
+tests/.config-*.json
+tests/.cli-config-*.json
+tests/.vault-*.json
+tests/legacy-*.json
