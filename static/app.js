@@ -23,6 +23,7 @@ const configForm=document.getElementById("config-form");
 const baseUrlInput=document.getElementById("base-url");
 const apiKeyInput=document.getElementById("api-key");
 const apiKeyRevealButton=document.getElementById("api-key-reveal");
+let apiKeyDraft="";
 const modelsInput=document.getElementById("models");
 const commonModelSelect=document.getElementById("common-model");
 const configError=document.getElementById("config-error");
@@ -38,7 +39,13 @@ const loginError=document.getElementById("login-error");
 const logoutButton=document.getElementById("logout");
 
 async function apiFetch(url,options){
-  const response=await fetch(url,options);
+  let response;
+  try{response=await fetch(url,options)}
+  catch(error){
+    if(error.name==="AbortError")throw error;
+    console.error(error);
+    throw new Error("无法连接到本地服务：请确认 server.py 仍在运行，然后重试");
+  }
   if(response.status===401){showLogin();throw new Error("请先登录")}
   return response;
 }
@@ -331,10 +338,10 @@ async function openConfigDialog(){
   try{const response=await apiFetch("/api/config");if(response.ok)saved={...saved,...await response.json()}}catch(error){console.error(error)}
   baseUrlInput.value=saved.base_url||saved.baseUrl||"";
   baseUrlInput.dataset.savedValue=baseUrlInput.value;
-  apiKeyInput.value="";
+  apiKeyInput.value=apiKeyDraft;
   apiKeyInput.type="password";
   apiKeyRevealButton.textContent="显示";
-  apiKeyRevealButton.hidden=!saved.api_key_saved||saved.key_reveal_enabled===false;
+  apiKeyRevealButton.hidden=Boolean(apiKeyDraft)||!saved.api_key_saved||saved.key_reveal_enabled===false;
   apiKeyInput.placeholder=saved.api_key_saved?`已保存（${saved.api_key_hint}），留空则保持不变`:"sk-...";
   const commonValues=Array.from(commonModelSelect.options).map((option)=>option.value);
   commonModelSelect.value=commonValues.includes(saved.default_model)?saved.default_model:"";
@@ -344,15 +351,15 @@ async function openConfigDialog(){
 }
 
 async function saveConfig(){
-  const baseUrl=baseUrlInput.value.trim().replace(/\/$/,"");const apiKey=apiKeyInput.value.trim();const commonModel=commonModelSelect.value;const customModels=modelsInput.value.split(",").map((item)=>item.trim()).filter(Boolean);const models=commonModel?[commonModel,...customModels]:customModels;const defaultModel=commonModel||customModels[0]||modelSelect.value;const submitButton=configForm.querySelector("button[type='submit']");configError.textContent="";submitButton.disabled=true;submitButton.textContent="正在连接...";
-  try{const modelOnly=!apiKey&&defaultModel&&baseUrl===baseUrlInput.dataset.savedValue;const payload=modelOnly?{model:defaultModel,models}:{base_url:baseUrl,models,default_model:defaultModel};if(apiKey&&!modelOnly)payload.api_key=apiKey;const response=await apiFetch(modelOnly?"/api/config/model":"/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||"配置保存失败");localStorage.setItem("chat-config",JSON.stringify({baseUrl,models}));if(defaultModel)localStorage.setItem("chat-model",defaultModel);await loadModels(defaultModel||null);return true}finally{apiKeyInput.value="";apiKeyInput.type="password";submitButton.disabled=false;submitButton.textContent="保存并连接"}
+  const baseUrl=baseUrlInput.value.trim().replace(/\/$/,"");const apiKey=apiKeyInput.value.trim();const keyChanged=apiKey!==apiKeyDraft;const commonModel=commonModelSelect.value;const customModels=modelsInput.value.split(",").map((item)=>item.trim()).filter(Boolean);const models=commonModel?[commonModel,...customModels]:customModels;const defaultModel=commonModel||customModels[0]||modelSelect.value;const submitButton=configForm.querySelector("button[type='submit']");configError.textContent="";submitButton.disabled=true;submitButton.textContent="正在连接...";
+  try{const modelOnly=!keyChanged&&defaultModel&&baseUrl===baseUrlInput.dataset.savedValue;const payload=modelOnly?{model:defaultModel,models}:{base_url:baseUrl,models,default_model:defaultModel};if(keyChanged&&apiKey)payload.api_key=apiKey;const response=await apiFetch(modelOnly?"/api/config/model":"/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||"配置保存失败");localStorage.setItem("chat-config",JSON.stringify({baseUrl,models}));if(defaultModel)localStorage.setItem("chat-model",defaultModel);await loadModels(defaultModel||null);if(keyChanged)apiKeyDraft=apiKey;apiKeyInput.value=apiKeyDraft;return true}finally{apiKeyInput.type="password";apiKeyRevealButton.textContent="显示";submitButton.disabled=false;submitButton.textContent="保存并连接"}
 }
 
 async function toggleApiKeyVisibility(){
   if(apiKeyInput.type==="text"){apiKeyInput.type="password";apiKeyRevealButton.textContent="显示";return}
   if(!apiKeyInput.value){
     apiKeyRevealButton.disabled=true;
-    try{const response=await apiFetch("/api/config/key",{headers:{"X-Reveal-Api-Key":"1"}});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||"无法读取 API Key");apiKeyInput.value=data.api_key||""}catch(error){configError.textContent=error.message;return}finally{apiKeyRevealButton.disabled=false}
+    try{const response=await apiFetch("/api/config/key",{headers:{"X-Reveal-Api-Key":"1"}});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||"无法读取 API Key");apiKeyInput.value=data.api_key||"";apiKeyDraft=apiKeyInput.value}catch(error){configError.textContent=error.message;return}finally{apiKeyRevealButton.disabled=false}
   }
   apiKeyInput.type="text";
   apiKeyRevealButton.textContent="隐藏";
@@ -383,7 +390,7 @@ async function startApp(){
   if("serviceWorker" in navigator)navigator.serviceWorker.register("/sw.js").catch(console.error);
   const oldConfig=localStorage.getItem("chat-config");
   if(oldConfig){try{const saved=JSON.parse(oldConfig);localStorage.setItem("chat-config",JSON.stringify({baseUrl:saved.baseUrl||"",models:saved.models||[]}))}catch(error){localStorage.removeItem("chat-config")}}
-  try{const response=await fetch("/api/session");const session=await response.json();if(session.auth_required&&!session.authenticated){showLogin();return}logoutButton.hidden=!session.auth_required;await initializeApp()}catch(error){console.error(error)}
+  try{const response=await apiFetch("/api/session");const session=await response.json();if(session.auth_required&&!session.authenticated){showLogin();return}logoutButton.hidden=!session.auth_required;await initializeApp()}catch(error){console.error(error);setStatus("当前页面无法连接本地服务（可能来自离线缓存）：请运行 python server.py，然后关闭本页面重新打开","error")}
 }
 
 updateSendButton();

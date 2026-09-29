@@ -33,7 +33,7 @@ MANIFEST_JSON = """{
 "icons":[{"src":"/icon.svg","sizes":"any","type":"image/svg+xml","purpose":"any"}]
 }"""
 
-SERVICE_WORKER_JS = """const CACHE="chat-app-v9";
+SERVICE_WORKER_JS = """const CACHE="chat-app-v11";
 const ASSETS=["/","/style.css","/app.js","/manifest.webmanifest","/icon.svg"];
 self.addEventListener("install",(event)=>{
 event.waitUntil(caches.open(CACHE).then((cache)=>cache.addAll(ASSETS)));
@@ -95,6 +95,9 @@ SESSION_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 FILE_PRIVATE_MODE = 0o600
 SECRET_SERVICE_NAME = "chat-app-api-key"
 SECRET_HELPER_TIMEOUT_SECONDS = 5.0
+RELAY_TIMEOUT_SECONDS = 60.0
+RELAY_DISCOVERY_TIMEOUT_SECONDS = 15.0
+RELAY_MAX_RETRIES = 1
 SECRET_FILE_BACKEND = "file"
 SECRET_HELPER_BACKENDS = {"macos-keychain", "libsecret"}
 UNIQUE_LOCAL_IPV6_PREFIX_BYTES = {0xFC, 0xFD}
@@ -222,6 +225,25 @@ def is_trusted_host_header(host_header):
     if ip_literal(hostname) is not None:
         return True
     return hostname in allowed_extra_hosts()
+
+
+def positive_float_env(name, default):
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def relay_timeout_seconds():
+    return positive_float_env("RELAY_TIMEOUT_SECONDS", RELAY_TIMEOUT_SECONDS)
+
+
+def relay_discovery_timeout_seconds():
+    return positive_float_env("RELAY_DISCOVERY_TIMEOUT_SECONDS", RELAY_DISCOVERY_TIMEOUT_SECONDS)
 
 
 def env_flag(name, default=True):
@@ -780,7 +802,12 @@ class ChatServer:
     def ensure_client(self):
         with self.config_lock:
             if self.api_key and self.base_url and self.client is None:
-                self.client = OpenAI(api_key=normalize_api_key(self.api_key), base_url=self.base_url)
+                self.client = OpenAI(
+                    api_key=normalize_api_key(self.api_key),
+                    base_url=self.base_url,
+                    timeout=relay_timeout_seconds(),
+                    max_retries=RELAY_MAX_RETRIES,
+                )
             client = self.client
         if client is None:
             raise RuntimeError("请先在左侧栏“连接设置”里填写 API URL 和 Key")
@@ -789,7 +816,9 @@ class ChatServer:
     def list_models(self):
         client = self.ensure_client()
         try:
-            discovered = normalize_models(model.id for model in client.models.list())
+            discovered = normalize_models(
+                model.id for model in client.models.list(timeout=relay_discovery_timeout_seconds())
+            )
             with self.config_lock:
                 self.discovered_models = discovered
         except Exception:

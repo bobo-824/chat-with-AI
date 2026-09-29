@@ -140,6 +140,11 @@ class StaticAssetTest(ServerTestCase):
             status, _text, _headers = self.exchange(asset)
             self.assertEqual(status, 200, asset)
 
+    def test_offline_shell_version_forces_a_fresh_app_script(self):
+        match = re.search(r'CACHE="chat-app-v(\d+)"', server.SERVICE_WORKER_JS)
+        self.assertIsNotNone(match, "the cached shell must be versioned")
+        self.assertGreaterEqual(int(match.group(1)), 11, "bump CACHE whenever the shell assets change")
+
     def test_static_map_matches_the_files_on_disk(self):
         for filename, _content_type in server.STATIC_FILES.values():
             self.assertTrue((ROOT / "static" / filename).is_file(), filename)

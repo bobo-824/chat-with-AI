@@ -107,6 +107,8 @@ python server.py
 | `ALLOW_KEY_REVEAL` | 是否允许在界面上确认后查看完整 API Key | `1` |
 | `COOKIE_SECURE` | 会话 Cookie 是否带 `Secure`：`auto` 按 `X-Forwarded-Proto` 判断 | `auto` |
 | `RELAY_CHECK_RESOLVED_ADDRESS` | 保存中转站地址时是否解析域名并检查解析结果 | `1` |
+| `RELAY_TIMEOUT_SECONDS` | 调用中转站的单次超时（秒），避免接口长时间无响应 | `60` |
+| `RELAY_DISCOVERY_TIMEOUT_SECONDS` | 获取模型列表的单次超时（秒），更短以保证设置界面不卡顿 | `15` |
 | `RELAY_DEBUG_RESPONSE` | 临时把中转站原始响应字段打印到终端（已脱敏） | `0` |
 
 启动时终端会打印当前使用的 API Key 存储方式，例如 `API Key storage backend: windows-dpapi.`；如果 macOS/Linux 上提示找不到系统凭据助手，说明退回到了本机文件保护模式。
@@ -141,6 +143,13 @@ python server.py
 注意：监听 `0.0.0.0` 时服务会强制要求 `APP_PASSWORD`，否则拒绝启动。第一次连接失败时，请允许 Python 通过防火墙的专用网络。
 
 ## 常见问题
+
+**提示“无法连接到本地服务”（浏览器里显示 `Failed to fetch`）**
+这不是配置保存失败，而是页面完全拿不到后端响应：通常是 `python server.py` 已经退出（关掉终端窗口、电脑休眠、或者监听非回环地址时没设 `APP_PASSWORD` 而拒绝启动）。
+页面看起来正常是因为离线缓存提供了页面壳，所以只按 F5 刷新可能仍然读取旧的 `app.js`。正确做法：
+1. 重新运行 `python server.py`，确认终端打印出访问地址（默认 `http://127.0.0.1:8000`）；
+2. **关闭整个标签页再重新打开**，或在 DevTools 的 Application → Service Workers / Storage 里注销并清空本站数据；
+3. 再点击“保存并连接”。密钥只保存在服务端，保存失败时输入框内容保留，可以直接重试。
 
 **端口被占用（`Address already in use` / `只能使用每个套接字地址…`）**
 换端口：`$env:PORT="8010"`（macOS/Linux：`PORT=8010`），然后重新打开对应地址。

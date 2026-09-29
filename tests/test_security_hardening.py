@@ -564,6 +564,64 @@ class ErrorRedactionTest(ServerTestCase):
         self.assertNotIn(API_KEY, json.dumps(dumped))
         self.assertEqual(dumped["notes"], "kept")
 
+class RelayTimeoutTest(unittest.TestCase):
+    """Upstream relay calls must fail fast instead of holding a browser socket."""
+
+    def build_chat_server(self):
+        config_path = Path(__file__).with_name(f".timeout-{uuid4().hex}.json")
+        self.addCleanup(config_path.unlink, missing_ok=True)
+        self.addCleanup(config_path.with_name(config_path.stem + ".secret.json").unlink, missing_ok=True)
+        chat_server = server.ChatServer(app_password="", config_path=config_path)
+        chat_server.api_key = API_KEY
+        chat_server.base_url = LOCAL_RELAY
+        return chat_server
+
+    def test_timeouts_are_configurable_and_reject_nonsense(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(server.relay_timeout_seconds(), server.RELAY_TIMEOUT_SECONDS)
+            self.assertEqual(server.relay_discovery_timeout_seconds(), server.RELAY_DISCOVERY_TIMEOUT_SECONDS)
+        with patch.dict(os.environ, {"RELAY_TIMEOUT_SECONDS": "7", "RELAY_DISCOVERY_TIMEOUT_SECONDS": "2"}):
+            self.assertEqual(server.relay_timeout_seconds(), 7.0)
+            self.assertEqual(server.relay_discovery_timeout_seconds(), 2.0)
+        with patch.dict(os.environ, {"RELAY_TIMEOUT_SECONDS": "soon", "RELAY_DISCOVERY_TIMEOUT_SECONDS": "0"}):
+            self.assertEqual(server.relay_timeout_seconds(), server.RELAY_TIMEOUT_SECONDS)
+            self.assertEqual(server.relay_discovery_timeout_seconds(), server.RELAY_DISCOVERY_TIMEOUT_SECONDS)
+
+    def test_relay_client_is_built_with_a_bounded_timeout(self):
+        captured = {}
+
+        class RecordingOpenAI:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        chat_server = self.build_chat_server()
+        with patch.object(server, "OpenAI", RecordingOpenAI):
+            chat_server.ensure_client()
+        self.assertIn("timeout", captured)
+        self.assertIn("max_retries", captured)
+        self.assertLessEqual(captured["timeout"], 120.0)
+        self.assertLess(captured["max_retries"], 3)
+
+    def test_model_discovery_bounds_its_own_request(self):
+        seen = {}
+
+        class RecordingModels:
+            def list(self, **kwargs):
+                seen.update(kwargs)
+                return []
+
+        class RecordingClient:
+            models = RecordingModels()
+
+        chat_server = self.build_chat_server()
+        chat_server.client = RecordingClient()
+        summary = chat_server.list_models()
+        self.assertIn("timeout", seen)
+        self.assertLessEqual(seen["timeout"], 30.0)
+        self.assertLess(seen["timeout"], server.relay_timeout_seconds())
+        self.assertEqual(summary["source"], "manual")
+
+
 
 if __name__ == "__main__":
     unittest.main()
