@@ -18,6 +18,7 @@ from ipaddress import ip_address
 from pathlib import Path
 from urllib.parse import urlsplit
 
+import httpx
 from openai import OpenAI
 
 
@@ -33,7 +34,7 @@ MANIFEST_JSON = """{
 "icons":[{"src":"/icon.svg","sizes":"any","type":"image/svg+xml","purpose":"any"}]
 }"""
 
-SERVICE_WORKER_JS = """const CACHE="chat-app-v11";
+SERVICE_WORKER_JS = """const CACHE="chat-app-v15";
 const ASSETS=["/","/style.css","/app.js","/manifest.webmanifest","/icon.svg"];
 self.addEventListener("install",(event)=>{
 event.waitUntil(caches.open(CACHE).then((cache)=>cache.addAll(ASSETS)));
@@ -109,6 +110,7 @@ BLOCKED_RELAY_HOSTNAMES = {
 RATE_LIMIT_WINDOWS = {
     "chat": (30, 60.0),
     "config_write": (20, 60.0),
+    "dictionary": (60, 60.0),
 }
 RATE_LIMIT_TRACKED_KEYS = 512
 
@@ -535,6 +537,583 @@ def dpapi_unprotect(data):
     return dpapi_transformation(ctypes.windll.crypt32.CryptUnprotectData, data)
 
 
+WEB_SEARCH_TOOL_NAME = "web_search"
+WEB_SEARCH_TOOL_TYPE = "web_search_20260209"
+WEB_SEARCH_MAX_USES = 3
+WEB_SEARCH_HINTS = ("search", "citation", "source", "reference")
+WEB_SEARCH_RESULT_BLOCK = "web_search_tool_result"
+ANTHROPIC_VERSION = "2023-06-01"
+ANTHROPIC_MAX_TOKENS = 4096
+NATIVE_SEARCH_MODEL_MARKER = "claude"
+CHAT_MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024
+IMAGE_DATA_URI_PATTERN = re.compile(r"^data:image/(png|jpeg|webp);base64,([A-Za-z0-9+/=]+)$")
+VISION_MODEL_MARKERS = (
+    "gpt-4o",
+    "gpt-4.1",
+    "gpt-41",
+    "gpt-5",
+    "o3",
+    "o4",
+    "claude",
+    "gemini",
+    "vision",
+    "-vl",
+    "vl-",
+    "llava",
+    "glm-4v",
+    "qwen-vl",
+    "internvl",
+)
+MAX_IMAGES_PER_MESSAGE = 1
+MAX_IMAGE_BYTES = 1_500_000
+VISION_INPUT_DISABLED_ERROR = "当前模型没有开启图片输入，请在“连接设置”里勾选“允许图片输入”"
+VISION_INPUT_TYPE_ERROR = "图片地址不合法：只接受本机内联的 PNG / JPEG / WebP 图片"
+VISION_INPUT_TOO_LARGE_ERROR = "图片太大，请在浏览器里压缩后再发送"
+VISION_INPUT_COUNT_ERROR = "一条消息最多附带 1 张图片"
+VISION_INPUT_ROLE_ERROR = "只有你发送的消息可以附带图片"
+VISION_INPUT_EMPTY_ERROR = "图片数据无法解码，请重新选择图片"
+NATIVE_SEARCH_IMAGE_UNAVAILABLE_NOTICE = "中转站的原生通道没有接受这次带图搜索，本轮已按普通对话回答（图片仍然有效）"
+NATIVE_SEARCH_UNAVAILABLE_NOTICE = "中转站未提供原生 Anthropic 搜索端点，本轮已按普通对话回答"
+NATIVE_SEARCH_UNSUPPORTED_MODEL_NOTICE = "联网搜索仅在 Claude 模型下可用，本轮已按普通对话回答"
+
+
+class NativeSearchUnavailable(RuntimeError):
+    """The gateway has no usable native Anthropic Messages endpoint for this request."""
+RELAY_SOURCE_LIMIT = 12
+RELAY_TEXT_LIMIT = 240
+RELAY_QUERY_PATTERN = re.compile(r"\x22(?:query|q|question)\x22\s*:\s*\x22([^\x22]+)")
+
+
+def relay_payload(messages):
+    """Project stored history back to the plain role/content pairs the relay understands."""
+    projected = []
+    for item in messages:
+        if isinstance(item, dict) and "role" in item and "content" in item:
+            images = item.get("images")
+            if images:
+                parts = [{"type": "text", "text": item["content"]}]
+                parts.extend({"type": "image_url", "image_url": {"url": image}} for image in images)
+                projected.append({"role": item["role"], "content": parts})
+            else:
+                projected.append({"role": item["role"], "content": item["content"]})
+        else:
+            projected.append(item)
+    return projected
+
+
+ANTHROPIC_IMAGE_MEDIA_TYPES = {"image/png", "image/jpeg", "image/webp"}
+
+
+def anthropic_image_block(image):
+    """Turn a validated inline data URI into a native Anthropic image block."""
+    header, _, payload = image.partition(",")
+    media_type = header.split(":", 1)[1].split(";", 1)[0].strip().lower() if ":" in header else ""
+    if media_type not in ANTHROPIC_IMAGE_MEDIA_TYPES or not payload:
+        raise ValueError(VISION_INPUT_TYPE_ERROR)
+    return {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": payload}}
+
+
+def anthropic_relay_payload(messages):
+    """Project messages onto the native Messages format; plain text stays a string."""
+    projected = []
+    for item in messages:
+        if not isinstance(item, dict) or "role" not in item or "content" not in item:
+            projected.append(item)
+            continue
+        images = item.get("images")
+        if not images:
+            projected.append({"role": item["role"], "content": item["content"]})
+            continue
+        blocks = []
+        if item["content"]:
+            blocks.append({"type": "text", "text": item["content"]})
+        blocks.extend(anthropic_image_block(image) for image in images)
+        projected.append({"role": item["role"], "content": blocks})
+    return projected
+
+
+def web_search_tool_declaration():
+    """Anthropic server tool declaration sent on the native Messages endpoint."""
+    return {"type": WEB_SEARCH_TOOL_TYPE, "name": WEB_SEARCH_TOOL_NAME, "max_uses": WEB_SEARCH_MAX_USES}
+
+
+def _relay_text(value):
+    return value if isinstance(value, str) else ""
+
+
+def _relay_clip(text, limit=RELAY_TEXT_LIMIT):
+    return re.sub(r"\s+", " ", str(text)).strip()[:limit]
+
+
+def _relay_url(value):
+    candidate = str(value or "").strip()
+    return candidate if candidate.startswith(("http://", "https://")) and len(candidate) <= 2048 else ""
+
+
+def _iter_json_nodes(value, trail=()):
+    if isinstance(value, dict):
+        yield value, trail
+        for key, item in value.items():
+            yield from _iter_json_nodes(item, trail + (str(key).lower(),))
+    elif isinstance(value, list):
+        for item in value:
+            yield from _iter_json_nodes(item, trail)
+
+
+def _relay_query(node):
+    for key in ("query", "q", "search_query", "question"):
+        value = node.get(key)
+        if isinstance(value, str) and value.strip():
+            return _relay_clip(value)
+    return ""
+
+
+def _relay_source(node):
+    url = _relay_url(node.get("url") or node.get("href") or node.get("link"))
+    title = _relay_text(node.get("title")) or _relay_text(node.get("name"))
+    if not url:
+        for key in ("url_citation", "citation", "source"):
+            nested = node.get(key)
+            if isinstance(nested, dict):
+                url = _relay_url(nested.get("url") or nested.get("href"))
+                title = title or _relay_text(nested.get("title"))
+                if url:
+                    break
+    if not url:
+        return None
+    source = {"url": url, "title": _relay_clip(title) or url}
+    snippet = _relay_clip(node.get("cited_text") or node.get("snippet") or node.get("description") or "", 160)
+    if snippet:
+        source["snippet"] = snippet
+    return source
+
+
+class RelaySearchCollector:
+    """Recover web-search queries and cited sources from OpenAI-format chunks of any shape."""
+
+    def __init__(self, api_key=""):
+        self.api_key = api_key or ""
+        self.queries = []
+        self.sources = []
+        self.calls = {}
+
+    def events(self, payload):
+        events = []
+        for node, trail in _iter_json_nodes(payload):
+            marker = " ".join(trail + (_relay_text(node.get("type")).lower(), _relay_text(node.get("name")).lower()))
+            function = node.get("function")
+            if isinstance(function, dict):
+                index = node.get("index") if isinstance(node.get("index"), int) else 0
+                call = self.calls.setdefault(index, {"name": "", "arguments": ""})
+                call["name"] += _relay_text(function.get("name"))
+                call["arguments"] += _relay_text(function.get("arguments"))
+                if "search" not in call["name"].lower():
+                    continue
+                events += self._emit(_relay_query(function) or self._partial_query(call["arguments"]))
+                continue
+            if not any(hint in marker for hint in WEB_SEARCH_HINTS):
+                continue
+            events += self._emit(_relay_query(node))
+            source = _relay_source(node)
+            if source is not None and len(self.sources) < RELAY_SOURCE_LIMIT:
+                if source["url"] not in [item["url"] for item in self.sources]:
+                    self.sources.append(source)
+                    events.append({"sources": [redact_relay_debug(source, self.api_key)]})
+        return events
+
+    def flush(self):
+        events = []
+        for call in self.calls.values():
+            if "search" in call.get("name", "").lower():
+                events += self._emit(self._partial_query(call.get("arguments", "")))
+        return events
+
+    def _emit(self, query):
+        if query and query not in self.queries:
+            self.queries.append(query)
+            return [{"search": {"query": redact_relay_debug(query, self.api_key)}}]
+        return []
+
+    @staticmethod
+    def _partial_query(arguments):
+        if not arguments:
+            return ""
+        try:
+            parsed = json.loads(arguments)
+        except (ValueError, TypeError):
+            parsed = None
+        if isinstance(parsed, dict):
+            return _relay_query(parsed)
+        match = RELAY_QUERY_PATTERN.search(arguments)
+        return _relay_clip(match.group(1)) if match else ""
+
+
+_native_client_lock = threading.Lock()
+_native_client = None
+
+
+def native_client():
+    """Reuse one HTTP client; building a TLS context is expensive on Windows."""
+    global _native_client
+    with _native_client_lock:
+        if _native_client is None or _native_client.is_closed:
+            _native_client = httpx.Client(follow_redirects=False)
+        return _native_client
+
+
+def model_supports_native_search(model):
+    """Anthropic ships web_search only as a Claude server tool."""
+    return NATIVE_SEARCH_MODEL_MARKER in (model or "").lower()
+
+
+def model_supports_vision(model):
+    """Best-effort guess at whether a model accepts image input."""
+    name = (model or "").lower()
+    return any(marker in name for marker in VISION_MODEL_MARKERS)
+
+
+def image_bytes_matches_kind(payload, kind):
+    if kind == "png":
+        return payload.startswith(b"\x89PNG\r\n\x1a\n")
+    if kind == "jpeg":
+        return payload.startswith(b"\xff\xd8\xff")
+    return payload[:4] == b"RIFF" and payload[8:12] == b"WEBP"
+
+
+def normalize_message_images(images, role, vision_enabled):
+    """Validate inline data: URIs and return the list to store with one message."""
+    if images is None or images == []:
+        return None
+    if not isinstance(images, list) or not all(isinstance(item, str) for item in images):
+        raise ValueError(VISION_INPUT_TYPE_ERROR)
+    if role != "user":
+        raise ValueError(VISION_INPUT_ROLE_ERROR)
+    if len(images) > MAX_IMAGES_PER_MESSAGE:
+        raise ValueError(VISION_INPUT_COUNT_ERROR)
+    if not vision_enabled:
+        raise ValueError(VISION_INPUT_DISABLED_ERROR)
+    cleaned = []
+    for item in images:
+        match = IMAGE_DATA_URI_PATTERN.match(item.strip())
+        if not match:
+            raise ValueError(VISION_INPUT_TYPE_ERROR)
+        try:
+            payload = base64.b64decode(match.group(2), validate=True)
+        except ValueError:
+            raise ValueError(VISION_INPUT_EMPTY_ERROR) from None
+        if not image_bytes_matches_kind(payload, match.group(1)):
+            raise ValueError(VISION_INPUT_TYPE_ERROR)
+        if len(payload) > MAX_IMAGE_BYTES:
+            raise ValueError(VISION_INPUT_TOO_LARGE_ERROR)
+        cleaned.append(item.strip())
+    return cleaned or None
+
+
+def normalize_chat_messages(messages, vision_enabled):
+    """Attach validated images to each message, keeping the plain text content intact."""
+    normalized = []
+    for item in messages:
+        message = {"role": item["role"], "content": item["content"]}
+        images = normalize_message_images(item.get("images"), item["role"], vision_enabled)
+        if images:
+            message["images"] = images
+        normalized.append(message)
+    return normalized
+
+
+def messages_have_images(messages):
+    return any(isinstance(item, dict) and item.get("images") for item in messages)
+
+
+def anthropic_messages_endpoint(base_url):
+    """Derive the gateway native Anthropic Messages URL from an OpenAI-compatible base URL."""
+    trimmed = (base_url or "").strip().rstrip("/")
+    if trimmed.endswith("/v1/messages"):
+        return trimmed
+    if trimmed.endswith("/v1"):
+        trimmed = trimmed[: -len("/v1")].rstrip("/")
+    if not trimmed:
+        raise ValueError("API URL 缺少有效的服务地址")
+    return f"{trimmed}/v1/messages"
+
+
+def anthropic_search_payload(messages, model):
+    """Build the native request body that carries the web_search server tool."""
+    return {
+        "model": model,
+        "max_tokens": ANTHROPIC_MAX_TOKENS,
+        "stream": True,
+        "tools": [web_search_tool_declaration()],
+        "messages": messages,
+    }
+
+
+def iter_anthropic_events(lines):
+    """Parse the data: payloads of an Anthropic SSE stream."""
+    for line in lines:
+        if not line or not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            event = json.loads(data)
+        except ValueError:
+            continue
+        if isinstance(event, dict):
+            yield event
+
+
+def _json_object(value):
+    if isinstance(value, dict):
+        return value
+    try:
+        parsed = json.loads(value)
+    except (ValueError, TypeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _anthropic_result_sources(block, api_key):
+    sources = []
+    for node, _trail in _iter_json_nodes(block.get("content")):
+        source = _relay_source(node)
+        if source is not None:
+            sources.append(redact_relay_debug(source, api_key))
+    return sources
+
+
+def translate_anthropic_stream(events, api_key=""):
+    """Map native Anthropic stream events onto the app content/search/sources payloads."""
+    blocks = {}
+    queries = []
+    urls = []
+
+    def emit_results(block):
+        found = []
+        for source in _anthropic_result_sources(block, api_key):
+            if source["url"] in urls or len(urls) >= RELAY_SOURCE_LIMIT:
+                continue
+            urls.append(source["url"])
+            found.append(source)
+        return [{"sources": [source]} for source in found]
+
+    for event in events:
+        kind = event.get("type")
+        if kind == "message_stop":
+            return
+        if kind == "error":
+            detail = event.get("error") if isinstance(event.get("error"), dict) else {}
+            reason = _relay_clip(f"{detail.get('type') or ''} {detail.get('message') or ''}".strip(), 300)
+            raise NativeSearchUnavailable(reason or "上游搜索请求失败")
+        if kind == "content_block_start":
+            block = event.get("content_block")
+            if not isinstance(block, dict):
+                continue
+            blocks[event.get("index")] = {"type": block.get("type"), "input": "", "block": block}
+            if block.get("type") == WEB_SEARCH_RESULT_BLOCK:
+                yield from emit_results(block)
+        elif kind == "content_block_delta":
+            delta = event.get("delta") if isinstance(event.get("delta"), dict) else {}
+            block = blocks.get(event.get("index"))
+            if delta.get("type") == "text_delta":
+                chunk_text = _relay_text(delta.get("text"))
+                if chunk_text:
+                    yield {"content": chunk_text}
+            elif delta.get("type") == "input_json_delta" and isinstance(block, dict):
+                block["input"] += _relay_text(delta.get("partial_json"))
+        elif kind == "content_block_stop":
+            block = blocks.get(event.get("index"))
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "server_tool_use":
+                query = _relay_query(_json_object(block["input"]))
+                if query and query not in queries:
+                    queries.append(query)
+                    yield {"search": {"query": redact_relay_debug(query, api_key)}}
+            elif block.get("type") == WEB_SEARCH_RESULT_BLOCK:
+                yield from emit_results(block["block"])
+
+
+DICTIONARY_JSON_PATH = Path(__file__).with_name("data") / "dict-en-zh.json"
+DICTIONARY_WORD_PATTERN = re.compile(r"^[A-Za-z][A-Za-z'\u2019-]{0,23}$")
+DICTIONARY_INDEX_WORD_PATTERN = re.compile(r"^[a-z][a-z']{0,23}$")
+DICTIONARY_MAX_SENSES = 6
+DICTIONARY_MAX_GLOSS_LENGTH = 400
+DICTIONARY_MAX_PHONETIC_LENGTH = 64
+DICTIONARY_MISS_HINT = "词典未收录该词，请检查拼写或改用完整词库"
+DICTIONARY_SUFFIX_RULES = (
+    ("iest", "y"),
+    ("ier", "y"),
+    ("ies", "y"),
+    ("ves", "f"),
+    ("es", ""),
+    ("s", ""),
+    ("ied", "y"),
+    ("ing", "e"),
+    ("ing", ""),
+    ("ed", "e"),
+    ("ed", ""),
+    ("d", ""),
+    ("est", ""),
+    ("er", ""),
+    ("ally", "al"),
+    ("ily", "y"),
+    ("ly", ""),
+)
+
+
+def dictionary_normalize_word(word):
+    return str(word).strip().lower().replace("\u2019", "'")
+
+
+def dictionary_split_gloss(text):
+    cleaned = re.sub(r"\s+", " ", str(text)).strip()
+    if not cleaned:
+        return None
+    match = re.match(r"^([A-Za-z]{1,9}\.)\s*(.+)$", cleaned)
+    if match:
+        return {"pos": match.group(1), "text": match.group(2)[:DICTIONARY_MAX_GLOSS_LENGTH]}
+    return {"pos": "", "text": cleaned[:DICTIONARY_MAX_GLOSS_LENGTH]}
+
+
+def dictionary_parse_senses(value):
+    if isinstance(value, str):
+        chunks = re.split(r"(?:\\n|[\n\r]+)", value)
+    elif isinstance(value, (list, tuple)):
+        chunks = []
+        for item in value:
+            chunks.extend(re.split(r"(?:\\n|[\n\r]+)", str(item)))
+    else:
+        return []
+    senses = []
+    seen = set()
+    for chunk in chunks:
+        for part in re.split(r"\s*\|\s*", chunk):
+            sense = dictionary_split_gloss(part)
+            if not sense:
+                continue
+            signature = (sense["pos"], sense["text"])
+            if signature in seen:
+                continue
+            seen.add(signature)
+            senses.append(sense)
+    return senses[:DICTIONARY_MAX_SENSES]
+
+
+def dictionary_suffix_forms(word):
+    candidates = [word]
+    for suffix, replacement in DICTIONARY_SUFFIX_RULES:
+        if len(word) > len(suffix) + 1 and word.endswith(suffix):
+            base = word[: len(word) - len(suffix)] + replacement
+            if base not in candidates:
+                candidates.append(base)
+    for candidate in list(candidates):
+        if len(candidate) >= 4 and candidate[-1] == candidate[-2] and candidate[-1] not in "aeiou":
+            collapsed = candidate[:-1]
+            if collapsed not in candidates:
+                candidates.append(collapsed)
+    return candidates
+
+
+class DictionaryStore:
+    """English to Chinese word lookup generated from ECDICT data (see tools/build_dictionary.py)."""
+
+    def __init__(self, json_path=None):
+        selected = json_path if json_path is not None else os.environ.get("DICTIONARY_PATH")
+        self.json_path = Path(selected) if selected else DICTIONARY_JSON_PATH
+        self.lock = threading.RLock()
+        self.payload = None
+        self.core_words = None
+        self.inflection_map = None
+
+    def load_payload(self):
+        if self.payload is None:
+            with self.lock:
+                if self.payload is None:
+                    try:
+                        payload = json.loads(self.json_path.read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        payload = None
+                    self.payload = payload if isinstance(payload, dict) else {}
+        return self.payload
+
+    def load_core(self):
+        if self.core_words is None:
+            with self.lock:
+                if self.core_words is None:
+                    payload = self.load_payload()
+                    phonetics = payload.get("phonetics")
+                    phonetics = phonetics if isinstance(phonetics, dict) else {}
+                    words = payload.get("words")
+                    words = words if isinstance(words, dict) else {}
+                    entries = {}
+                    for raw_word, raw_senses in words.items():
+                        key = dictionary_normalize_word(raw_word)
+                        if not DICTIONARY_INDEX_WORD_PATTERN.match(key):
+                            continue
+                        senses = dictionary_parse_senses(raw_senses)
+                        if not senses:
+                            continue
+                        entries[key] = {
+                            "results": senses,
+                            "phonetic": str(phonetics.get(raw_word, ""))[:DICTIONARY_MAX_PHONETIC_LENGTH],
+                            "source": "local",
+                        }
+                    self.core_words = entries
+        return self.core_words
+
+    def load_inflections(self):
+        if self.inflection_map is None:
+            with self.lock:
+                if self.inflection_map is None:
+                    payload = self.load_payload()
+                    raw = payload.get("inflections")
+                    raw = raw if isinstance(raw, dict) else {}
+                    forms = {}
+                    for key, value in raw.items():
+                        word = dictionary_normalize_word(key)
+                        base = dictionary_normalize_word(value)
+                        if (
+                            DICTIONARY_INDEX_WORD_PATTERN.match(word)
+                            and DICTIONARY_INDEX_WORD_PATTERN.match(base)
+                            and word != base
+                        ):
+                            forms[word] = base
+                    self.inflection_map = forms
+        return self.inflection_map
+
+    def candidate_forms(self, word):
+        candidates = dictionary_suffix_forms(word)
+        inflections = self.load_inflections()
+        for candidate in list(candidates):
+            base = inflections.get(candidate)
+            if base and base not in candidates:
+                candidates.append(base)
+        return candidates[:8]
+
+    def lookup(self, word):
+        query = dictionary_normalize_word(word)
+        for candidate in self.candidate_forms(query):
+            entry = self.load_core().get(candidate)
+            if entry:
+                return {
+                    "word": query,
+                    "query": candidate,
+                    "source": entry["source"],
+                    "phonetic": entry["phonetic"],
+                    "results": entry["results"],
+                }
+        return {
+            "word": query,
+            "query": query,
+            "source": "local",
+            "phonetic": "",
+            "results": [],
+            "hint": DICTIONARY_MISS_HINT,
+        }
+
+
 class AppConfigStore:
     def __init__(self, path=None):
         self.path = Path(path) if path else Path(__file__).with_name("app-config.json")
@@ -623,6 +1202,7 @@ class ChatServer:
     def __init__(self, app_password=None, config_path=None):
         self.client = None
         self.conversations = ConversationStore()
+        self.dictionary = DictionaryStore()
         self.config_store = AppConfigStore(config_path)
         secret_path = self.config_store.path.with_name(
             "app-secret.json" if config_path is None else f"{self.config_store.path.stem}.secret.json"
@@ -653,6 +1233,9 @@ class ChatServer:
             or saved_config.get("default_model")
             or (self.configured_models[0] if self.configured_models else None)
         )
+        self.web_search_enabled = bool(saved_config.get("web_search"))
+        self.vision_input = bool(saved_config.get("vision_input"))
+        self.search_input = bool(saved_config.get("search_input"))
         self.app_password = app_password if app_password is not None else os.environ.get("APP_PASSWORD")
         self.session_lock = threading.Lock()
         self.sessions = {}
@@ -734,6 +1317,9 @@ class ChatServer:
         default_model=None,
         persist=True,
         persist_api_key=True,
+        web_search=None,
+        vision_input=None,
+        search_input=None,
     ):
         api_key = normalize_api_key(api_key)
         base_url = validate_relay_base_url(base_url)
@@ -746,6 +1332,12 @@ class ChatServer:
                 self.configured_models = normalize_models(models)
             if default_model is not None:
                 self.default_model = default_model.strip() or None
+            if web_search is not None:
+                self.web_search_enabled = bool(web_search)
+            if vision_input is not None:
+                self.vision_input = bool(vision_input)
+            if search_input is not None:
+                self.search_input = bool(search_input)
             if persist:
                 if persist_api_key:
                     self.secret_store.save(self.api_key)
@@ -753,6 +1345,9 @@ class ChatServer:
                     "base_url": self.base_url,
                     "models": self.configured_models,
                     "default_model": self.default_model,
+                    "web_search": self.web_search_enabled,
+                    "vision_input": self.vision_input,
+                    "search_input": self.search_input,
                 })
 
     def select_default_model(self, model, models=None):
@@ -767,6 +1362,9 @@ class ChatServer:
                 "base_url": self.base_url,
                 "models": self.configured_models,
                 "default_model": self.default_model,
+                "web_search": self.web_search_enabled,
+                "vision_input": self.vision_input,
+                "search_input": self.search_input,
             })
 
     def rate_limit_key(self, token, source_ip):
@@ -797,7 +1395,18 @@ class ChatServer:
                 "models": list(self.configured_models),
                 "default_model": self.default_model,
                 "key_reveal_enabled": self.key_reveal_allowed(),
+                "web_search_enabled": bool(self.web_search_enabled),
+                "vision_input_enabled": bool(self.vision_input),
+                "vision_auto_supported": model_supports_vision(self.default_model),
+                "search_input_enabled": bool(self.search_input),
+                "search_auto_supported": model_supports_native_search(self.default_model),
             }
+
+    def vision_allowed_for(self, model):
+        return self.vision_input or model_supports_vision(model)
+
+    def search_allowed_for(self, model):
+        return self.search_input or model_supports_native_search(model)
 
     def ensure_client(self):
         with self.config_lock:
@@ -826,17 +1435,50 @@ class ChatServer:
                 discovered = list(self.discovered_models)
         models = normalize_models([*discovered, *self.configured_models])
         source = "relay" if discovered else "manual"
-        return {"models": models, "source": source, "default_model": self.default_model}
+        return {
+            "models": models,
+            "discovered_models": normalize_models(discovered),
+            "source": source,
+            "default_model": self.default_model,
+        }
 
     def is_configured(self):
         return bool(self.api_key and self.base_url)
 
-    def stream_chat(self, messages, model):
+    def stream_chat(self, messages, model, web_search=False):
+        payload_messages = relay_payload(messages)
+        has_images = messages_have_images(messages)
+        if web_search:
+            if self.search_allowed_for(model):
+                started = False
+                try:
+                    native_messages = (
+                        anthropic_relay_payload(messages) if has_images else payload_messages
+                    )
+                    for event in self.stream_anthropic_search(native_messages, model):
+                        started = True
+                        yield event
+                    return
+                except Exception as error:
+                    if started:
+                        raise
+                    if relay_debug_enabled():
+                        self.log_relay_debug(
+                            "native_search_unavailable", {"reason": self.safe_error_message(error)}
+                        )
+                    yield {
+                        "notice": NATIVE_SEARCH_IMAGE_UNAVAILABLE_NOTICE
+                        if has_images
+                        else NATIVE_SEARCH_UNAVAILABLE_NOTICE
+                    }
+            else:
+                yield {"notice": NATIVE_SEARCH_UNSUPPORTED_MODEL_NOTICE}
+
         client = self.ensure_client()
         if relay_debug_enabled():
             with client.chat.completions.with_streaming_response.create(
                 model=model,
-                messages=messages,
+                messages=payload_messages,
                 stream=True,
             ) as raw_response:
                 headers = redact_relay_debug(dict(raw_response.http_response.headers), self.api_key)
@@ -849,46 +1491,84 @@ class ChatServer:
                 yield from self.stream_relay_chunks(response)
             return
 
-        response = client.chat.completions.create(model=model, messages=messages, stream=True)
+        response = client.chat.completions.create(model=model, messages=payload_messages, stream=True)
         yield from self.stream_relay_chunks(response, debug=False)
+
+    def stream_anthropic_search(self, messages, model):
+        """Stream a Claude answer that may call the native web_search server tool."""
+        endpoint = anthropic_messages_endpoint(self.base_url)
+        headers = {
+            "x-api-key": self.api_key or "",
+            "anthropic-version": ANTHROPIC_VERSION,
+            "content-type": "application/json",
+            "accept": "text/event-stream",
+        }
+        body = anthropic_search_payload(messages, model)
+        client = native_client()
+        with client.stream(
+            "POST", endpoint, json=body, headers=headers, timeout=relay_timeout_seconds()
+        ) as response:
+            if response.status_code != 200:
+                detail = _relay_clip(response.read().decode("utf-8", "replace"), 300)
+                raise NativeSearchUnavailable(f"HTTP {response.status_code}: {detail}")
+            yield from translate_anthropic_stream(iter_anthropic_events(response.iter_lines()), self.api_key)
 
     def stream_relay_chunks(self, response, debug=True):
         identity = {}
+        collector = RelaySearchCollector(self.api_key)
         for index, chunk in enumerate(response):
+            payload = redact_relay_debug(chunk.model_dump(mode="json", exclude_unset=True), self.api_key)
             if debug:
-                payload = redact_relay_debug(chunk.model_dump(mode="json", exclude_unset=True), self.api_key)
                 self.log_relay_debug("chunk", {"index": index, "data": payload})
                 for key in RELAY_DEBUG_IDENTITY_FIELDS:
                     if key in payload and payload[key] is not None:
                         identity[key] = payload[key]
-            if not chunk.choices:
-                continue
-            content = chunk.choices[0].delta.content
-            if content:
-                yield {"content": content}
+            for choice in payload.get("choices") or []:
+                if not isinstance(choice, dict):
+                    continue
+                delta = choice.get("delta")
+                content = delta.get("content") if isinstance(delta, dict) else None
+                if isinstance(content, str) and content:
+                    yield {"content": content}
+            for event in collector.events(payload):
+                yield event
+        for event in collector.flush():
+            yield event
         if debug:
             self.log_relay_debug("identity_summary", identity)
 
     def log_relay_debug(self, event, data):
         print("[relay-response-debug] " + json.dumps({"event": event, **data}, ensure_ascii=False), flush=True)
 
-    def chat_with_memory(self, conversation_id, messages, model):
+    def chat_with_memory(self, conversation_id, messages, model, web_search=False):
         if not conversation_id:
             conversation_id = uuid.uuid4().hex
         self.conversations.save_messages(conversation_id, messages, model)
         yield {"conversation_id": conversation_id}
         reply_parts = []
+        searches = []
+        sources = []
         try:
-            for part in self.stream_chat(messages, model):
+            for part in self.stream_chat(messages, model, web_search=web_search):
                 content = part.get("content", "")
                 if content:
                     reply_parts.append(content)
+                query = (part.get("search") or {}).get("query")
+                if query and query not in searches:
+                    searches.append(query)
+                for source in part.get("sources") or []:
+                    if source.get("url") and source["url"] not in [item.get("url") for item in sources]:
+                        sources.append(source)
                 yield part
         finally:
             reply = "".join(reply_parts)
             if reply:
-                saved_messages = messages + [{"role": "assistant", "content": reply}]
-                self.conversations.save_messages(conversation_id, saved_messages, model)
+                assistant_message = {"role": "assistant", "content": reply}
+                if searches:
+                    assistant_message["search"] = searches
+                if sources:
+                    assistant_message["sources"] = sources
+                self.conversations.save_messages(conversation_id, messages + [assistant_message], model)
 
 
 class ConversationStore:
@@ -1086,12 +1766,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(401, {"error": "Authentication required"})
         return False
 
-    def drain_request_body(self):
+    def drain_request_body(self, max_bytes=MAX_REQUEST_BODY_BYTES):
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except (TypeError, ValueError):
             length = -1
-        if not 0 <= length <= MAX_REQUEST_BODY_BYTES:
+        if not 0 <= length <= max_bytes:
             self.close_connection = True
             return
         while length > 0:
@@ -1138,10 +1818,15 @@ class Handler(BaseHTTPRequestHandler):
             return True
         return self.reject_request(415, "请求体格式必须是 application/json")
 
-    def read_json_body(self):
+    def read_json_body(self, max_bytes=MAX_REQUEST_BODY_BYTES):
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            if length <= 0 or length > MAX_REQUEST_BODY_BYTES:
+            if length <= 0:
+                return None
+            if length > max_bytes:
+                # The oversized body is deliberately left unread, so the socket must
+                # not be reused: the leftovers would be parsed as a second request.
+                self.close_connection = True
                 return None
             return json.loads(self.rfile.read(length).decode("utf-8"))
         except (ValueError, json.JSONDecodeError):
@@ -1249,6 +1934,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/chat" and not self.require_rate_limit("chat"):
             return
+        if path == "/api/dictionary" and not self.require_rate_limit("dictionary"):
             return
         if path == "/api/config":
             body = self.read_json_body()
@@ -1274,6 +1960,18 @@ class Handler(BaseHTTPRequestHandler):
             if default_model is not None and not isinstance(default_model, str):
                 self.send_json(400, {"error": "模型格式错误"})
                 return
+            web_search = body.get("web_search")
+            if web_search is not None and not isinstance(web_search, bool):
+                self.send_json(400, {"error": "联网搜索开关格式错误"})
+                return
+            vision_input = body.get("vision_input")
+            if vision_input is not None and not isinstance(vision_input, bool):
+                self.send_json(400, {"error": "图片输入开关格式错误"})
+                return
+            search_input = body.get("search_input")
+            if search_input is not None and not isinstance(search_input, bool):
+                self.send_json(400, {"error": "搜索模型开关格式错误"})
+                return
             models = normalize_models(models)
             default_model = (default_model or "").strip() or (models[0] if models else None)
             models = normalize_models([*models, default_model] if default_model else models)
@@ -1284,6 +1982,9 @@ class Handler(BaseHTTPRequestHandler):
                     models,
                     default_model,
                     persist_api_key=key_provided,
+                    web_search=web_search,
+                    vision_input=vision_input,
+                    search_input=search_input,
                 )
             except OSError as error:
                 self.send_json(500, {"error": self.chat_server.safe_error_message(error)})
@@ -1309,11 +2010,22 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_json(200, {"ok": True, "default_model": self.chat_server.default_model})
             return
+        if path == "/api/dictionary":
+            body = self.read_json_body()
+            if not isinstance(body, dict):
+                self.send_json(400, {"error": "Invalid JSON body"})
+                return
+            word = body.get("word")
+            if not isinstance(word, str) or not DICTIONARY_WORD_PATTERN.match(word.strip()):
+                self.send_json(400, {"error": "请输入一个英文单词"})
+                return
+            self.send_json(200, self.chat_server.dictionary.lookup(word))
+            return
         if path != "/api/chat":
             self.send_json(404, {"error": "Not found"})
             return
 
-        body = self.read_json_body()
+        body = self.read_json_body(CHAT_MAX_REQUEST_BODY_BYTES)
         if body is None:
             self.send_json(400, {"error": "Invalid JSON body"})
             return
@@ -1337,6 +2049,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(400, {"error": "No model selected"})
             return
         model = model.strip()
+        try:
+            messages = normalize_chat_messages(messages, self.chat_server.vision_allowed_for(model))
+        except ValueError as error:
+            self.send_json(400, {"error": str(error)})
+            return
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -1346,7 +2063,9 @@ class Handler(BaseHTTPRequestHandler):
         self.close_connection = True
 
         try:
-            for part in self.chat_server.chat_with_memory(conversation_id, messages, model):
+            for part in self.chat_server.chat_with_memory(
+                conversation_id, messages, model, web_search=self.chat_server.web_search_enabled
+            ):
                 data = "data: " + json.dumps(part, ensure_ascii=False) + "\n\n"
                 self.wfile.write(data.encode("utf-8"))
                 self.wfile.flush()
@@ -1371,6 +2090,18 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+class AppServer(ThreadingHTTPServer):
+    """Bind the port exclusively on Windows.
+
+    ``HTTPServer`` sets SO_REUSEADDR, and on Windows that lets a second listener
+    share the port: a "restarted" app then silently coexists with the stale one,
+    leaving the browser served by the old process. POSIX needs the flag to rebind
+    quickly after TIME_WAIT, so only tighten it where it is actually harmful.
+    """
+
+    allow_reuse_address = os.name != "nt"
+
+
 def main():
     host = os.environ.get("HOST", "127.0.0.1")
     port = int(os.environ.get("PORT", "8000"))
@@ -1382,7 +2113,7 @@ def main():
         return 1
 
     Handler.chat_server = ChatServer(app_password=app_password)
-    server = ThreadingHTTPServer((host, port), Handler)
+    server = AppServer((host, port), Handler)
 
     print(f"Chat app running on http://{host}:{port}")
     storage_backend = secret_backend_name()

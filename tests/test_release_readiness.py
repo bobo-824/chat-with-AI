@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import socket
 import sys
 import unittest
 from pathlib import Path
@@ -130,6 +131,27 @@ class FirstRunExperienceTest(ServerTestCase):
         self.assertTrue(self.secret_path.exists())
         self.assertNotIn(API_KEY, self.secret_path.read_text(encoding="utf-8"))
         self.assertNotIn(API_KEY, self.config_path.read_text(encoding="utf-8"))
+
+
+class StartupHygieneTest(unittest.TestCase):
+    def test_second_instance_cannot_share_the_port(self):
+        self.assertEqual(server.AppServer.allow_reuse_address, os.name == "posix")
+        if os.name != "nt":
+            return
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        first = server.AppServer(("127.0.0.1", port), server.Handler)
+        try:
+            with self.assertRaises(OSError):
+                server.AppServer(("127.0.0.1", port), server.Handler)
+        finally:
+            first.server_close()
+
+    def test_main_uses_the_exclusive_server_class(self):
+        source = (ROOT / "server.py").read_text(encoding="utf-8")
+        self.assertIn("server = AppServer((host, port), Handler)", source)
 
 
 class StaticAssetTest(ServerTestCase):

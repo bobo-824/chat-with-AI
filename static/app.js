@@ -25,6 +25,14 @@ const apiKeyInput=document.getElementById("api-key");
 const apiKeyRevealButton=document.getElementById("api-key-reveal");
 let apiKeyDraft="";
 const modelsInput=document.getElementById("models");
+const webSearchInput=document.getElementById("web-search");
+const dictionaryToggleInput=document.getElementById("dictionary-enabled");
+const visionInput=document.getElementById("vision-input");
+const searchInput=document.getElementById("search-input");
+const modelHint=document.getElementById("model-hint");
+const attachButton=document.getElementById("attach-image");
+const imageInput=document.getElementById("image-input");
+const attachmentsEl=document.getElementById("attachments");
 const commonModelSelect=document.getElementById("common-model");
 const configError=document.getElementById("config-error");
 const configCancelButton=document.getElementById("config-cancel");
@@ -156,6 +164,48 @@ function createAction(label,handler){
   return button;
 }
 
+function assistantRecord(content,searches,sources){
+  const record={role:"assistant",content};
+  if(searches.length)record.search=[...searches];
+  if(sources.length)record.sources=[...sources];
+  return record;
+}
+
+function renderSearchTrace(parent,searches,sources){
+  parent.querySelector(".search-trace")?.remove();
+  if(!searches.length&&!sources.length)return;
+  const trace=document.createElement("div");
+  trace.className="search-trace";
+  if(searches.length){
+    const line=document.createElement("p");
+    line.className="message-search";
+    line.textContent=`联网搜索：${searches.join("、")}`;
+    trace.appendChild(line);
+  }
+  const list=document.createElement("ul");
+  list.className="message-sources";
+  for(const source of sources){
+    const url=String(source.url||"");
+    if(!/^https?:\/\//i.test(url))continue;
+    const item=document.createElement("li");
+    const link=document.createElement("a");
+    link.href=url;
+    link.target="_blank";
+    link.rel="noopener noreferrer";
+    link.textContent=String(source.title||url).slice(0,120);
+    item.appendChild(link);
+    if(source.snippet){
+      const note=document.createElement("span");
+      note.textContent=String(source.snippet).slice(0,160);
+      item.appendChild(note);
+    }
+    list.appendChild(item);
+  }
+  if(list.children.length)trace.appendChild(list);
+  const actions=parent.querySelector(".message-actions");
+  if(actions)parent.insertBefore(trace,actions);else parent.appendChild(trace);
+}
+
 function appendMessage(role,text,options={}){
   const article=document.createElement("article");
   article.className=`message ${role}${options.loading?" loading":""}${options.error?" error":""}`;
@@ -167,10 +217,23 @@ function appendMessage(role,text,options={}){
   }
   const bodyElement=document.createElement("div");
   bodyElement.className="message-body";
+  if(options.images&&options.images.length){
+    const strip=document.createElement("div");
+    strip.className="message-images";
+    for(const image of options.images){
+      const picture=document.createElement("img");
+      picture.src=image;
+      picture.alt="随消息携带的图片";
+      picture.loading="lazy";
+      strip.append(picture);
+    }
+    bodyElement.append(strip);
+  }
   const content=document.createElement("div");
   content.className="message-content";
   if(role==="assistant")renderMarkdown(content,text);else content.textContent=text;
   bodyElement.appendChild(content);
+  if(options.searches||options.sources)renderSearchTrace(bodyElement,options.searches||[],options.sources||[]);
   if(!options.loading){
     const actions=document.createElement("div");
     actions.className="message-actions";
@@ -186,8 +249,9 @@ function appendMessage(role,text,options={}){
 }
 
 function renderMessages(){
+  closeDictionaryCard();
   messagesEl.innerHTML="";
-  messages.forEach((item,index)=>appendMessage(item.role,item.content,{retry:item.role==="assistant"?()=>retryAssistant(index):null}));
+  messages.forEach((item,index)=>appendMessage(item.role,item.content,{retry:item.role==="assistant"?()=>retryAssistant(index):null,searches:item.search||[],sources:item.sources||[],images:item.images||[]}));
   updateEmptyState();
 }
 
@@ -206,7 +270,7 @@ function renderConversations(){
 }
 
 function closeSidebar(){body.classList.remove("sidebar-open")}
-function resetConversation(){if(isGenerating)stopGeneration();conversationId=null;messages.length=0;renderMessages();renderConversations();closeSidebar();setStatus();input.focus()}
+function resetConversation(){if(isGenerating)stopGeneration();conversationId=null;messages.length=0;pendingImage=null;renderAttachments();renderMessages();renderConversations();closeSidebar();setStatus();input.focus()}
 
 function updateSendButton(){
   sendButton.classList.toggle("stop",isGenerating);
@@ -242,7 +306,7 @@ async function persistSelectedModel(model){
 }
 
 async function loadModels(preferredModel=null){
-  try{const response=await apiFetch("/api/models");const data=await response.json();if(!response.ok)throw new Error(data.error||"无法加载模型");const models=data.models||[];const current=modelSelect.value;modelSelect.innerHTML="";for(const model of models)modelSelect.appendChild(new Option(model,model));const saved=localStorage.getItem("chat-model");const conversationModel=preferredModel||pendingConversationModel;const selected=[data.default_model,current,saved,models[0]].find((model)=>model&&models.includes(model));if(conversationModel)selectModel(conversationModel,true);else if(selected)selectModel(selected);else setModelPlaceholder("未配置模型");pendingConversationModel=null;modelSelect.title=data.source==="relay"?"模型来自中转站（包含手动模型）":"使用手动配置的模型"}catch(error){setModelPlaceholder("连接中转站");console.error(error)}
+  try{const response=await apiFetch("/api/models");const data=await response.json();if(!response.ok)throw new Error(data.error||"无法加载模型");const models=data.models||[];relayModels=Array.isArray(data.discovered_models)?data.discovered_models:[];const current=modelSelect.value;modelSelect.innerHTML="";for(const model of models)modelSelect.appendChild(new Option(model,model));const saved=localStorage.getItem("chat-model");const conversationModel=preferredModel||pendingConversationModel;const selected=[data.default_model,current,saved,models[0]].find((model)=>model&&models.includes(model));if(conversationModel)selectModel(conversationModel,true);else if(selected)selectModel(selected);else setModelPlaceholder("未配置模型");pendingConversationModel=null;refreshModelHint();modelSelect.title=data.source==="relay"?"模型来自中转站（包含手动模型）":"使用手动配置的模型"}catch(error){setModelPlaceholder("连接中转站");console.error(error)}
 }
 
 function stopGeneration(){
@@ -261,12 +325,17 @@ function retryAssistant(index){
 async function sendMessage(){
   if(isGenerating){stopGeneration();return}
   const text=input.value.trim();
+  const image=pendingImage;
   if(!text)return;
   if(!modelSelect.value){openConfigDialog();configError.textContent="请先配置中转站并选择一个模型。";return}
   input.value="";
   input.style.height="auto";
-  messages.push({role:"user",content:text});
-  appendMessage("user",text);
+  const record={role:"user",content:text};
+  if(image)record.images=[image];
+  messages.push(record);
+  appendMessage("user",text,{images:image?[image]:[]});
+  pendingImage=null;
+  renderAttachments();
   await requestCompletion();
 }
 
@@ -278,6 +347,9 @@ async function requestCompletion(){
   const assistant=appendMessage("assistant","",{loading:true});
   let reply="";
   let failed=false;
+  let streamNotice="";
+  const searches=[];
+  const sources=[];
   try{
     const response=await apiFetch("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({conversation_id:conversationId,messages,model:modelSelect.value}),signal:activeController.signal});
     if(!response.ok){const data=await response.json().catch(()=>({}));throw new Error(data.error||"请求失败")}
@@ -297,16 +369,20 @@ async function requestCompletion(){
         const payload=JSON.parse(payloadText);
         if(payload.conversation_id)conversationId=payload.conversation_id;
         if(payload.error)throw new Error(payload.error);
+        if(payload.notice){streamNotice=payload.notice;setStatus(payload.notice,"error")}
+        if(payload.search&&payload.search.query&&searches.indexOf(payload.search.query)<0){searches.push(payload.search.query);setStatus(`正在联网搜索：${payload.search.query}`,"busy")}
+        for(const source of payload.sources||[]){if(source&&source.url&&sources.every((item)=>item.url!==source.url))sources.push(source)}
+        if(payload.search||payload.sources)renderSearchTrace(assistant.bodyElement,searches,sources);
         reply+=payload.content||"";
         renderMarkdown(assistant.content,reply);
         scrollToBottom();
       }
     }
-    if(reply)messages.push({role:"assistant",content:reply});
-    setStatus();
+    if(reply)messages.push(assistantRecord(reply,searches,sources));
+    setStatus(streamNotice, streamNotice?"error":"");
   }catch(error){
     if(error.name==="AbortError"){
-      if(reply)messages.push({role:"assistant",content:reply});
+      if(reply)messages.push(assistantRecord(reply,searches,sources));
       else assistant.article.remove();
     }else{
       failed=true;
@@ -332,6 +408,255 @@ async function requestCompletion(){
   }
 }
 
+const MAX_UPLOAD_IMAGE_BYTES=1024*1024;
+const MAX_READ_IMAGE_BYTES=20*1024*1024;
+let pendingImage=null;
+let visionEnabled=false;
+let relayModels=[];
+
+function estimateDataUrlBytes(dataUrl){
+  return Math.floor((dataUrl.length-dataUrl.indexOf(",")-1)*0.75);
+}
+
+async function decodeImage(file){
+  if("createImageBitmap" in window){
+    try{return await createImageBitmap(file)}catch(error){}
+  }
+  const url=URL.createObjectURL(file);
+  try{
+    const image=new Image();
+    await new Promise((resolve,reject)=>{image.onload=resolve;image.onerror=()=>reject(new Error("\u56fe\u7247\u8bfb\u53d6\u5931\u8d25"));image.src=url});
+    return image;
+  }finally{URL.revokeObjectURL(url)}
+}
+
+async function compressImage(file){
+  if(!file||(file.type&&!file.type.startsWith("image/")))throw new Error("\u53ea\u80fd\u6dfb\u52a0\u56fe\u7247\u6587\u4ef6");
+  if(file.size>MAX_READ_IMAGE_BYTES)throw new Error("\u56fe\u7247\u8d85\u8fc7 20MB\uff0c\u8bf7\u6362\u4e00\u5f20");
+  const source=await decodeImage(file);
+  const width=source.width||source.displayWidth;
+  const height=source.height||source.displayHeight;
+  if(!width||!height)throw new Error("\u65e0\u6cd5\u8bfb\u53d6\u56fe\u7247\u5c3a\u5bf8");
+  let scale=1;
+  for(let attempt=0;attempt<4;attempt++){
+    const canvas=document.createElement("canvas");
+    canvas.width=Math.max(1,Math.round(width*scale));
+    canvas.height=Math.max(1,Math.round(height*scale));
+    const context=canvas.getContext("2d");
+    context.fillStyle="#ffffff";
+    context.fillRect(0,0,canvas.width,canvas.height);
+    context.drawImage(source,0,0,canvas.width,canvas.height);
+    const dataUrl=canvas.toDataURL("image/jpeg",Math.max(0.4,0.82-attempt*0.12));
+    if(estimateDataUrlBytes(dataUrl)<=MAX_UPLOAD_IMAGE_BYTES)return dataUrl;
+    scale*=0.7;
+  }
+  throw new Error("\u56fe\u7247\u538b\u7f29\u540e\u4ecd\u7136\u592a\u5927\uff0c\u8bf7\u6362\u4e00\u5f20\u5c0f\u4e00\u70b9\u7684\u56fe");
+}
+
+function renderAttachments(){
+  attachmentsEl.textContent="";
+  attachmentsEl.hidden=!pendingImage;
+  if(!pendingImage)return;
+  const chip=document.createElement("div");
+  chip.className="attachment-chip";
+  const picture=document.createElement("img");
+  picture.src=pendingImage;
+  picture.alt="\u5f85\u53d1\u9001\u7684\u56fe\u7247";
+  const note=document.createElement("span");
+  note.textContent=`\u56fe\u7247 ${Math.round(estimateDataUrlBytes(pendingImage)/1024)} KB`;
+  chip.append(picture,note,createAction("\u79fb\u9664",()=>{pendingImage=null;renderAttachments();input.focus()}));
+  attachmentsEl.append(chip);
+}
+
+function refreshImageControls(){
+  attachButton.hidden=!visionEnabled;
+  if(!visionEnabled&&pendingImage){pendingImage=null;renderAttachments()}
+}
+
+async function attachImageFile(file){
+  if(!file)return;
+  if(!visionEnabled){setStatus("\u8bf7\u5148\u5728\u201c\u8fde\u63a5\u8bbe\u7f6e\u201d\u91cc\u5f00\u542f\u56fe\u7247\u8f93\u5165\u3002","error");imageInput.value="";return}
+  setStatus("\u6b63\u5728\u538b\u7f29\u56fe\u7247\u2026","busy");
+  try{
+    pendingImage=await compressImage(file);
+    renderAttachments();
+    setStatus();
+  }catch(error){
+    setStatus(error.message||"\u56fe\u7247\u8bfb\u53d6\u5931\u8d25","error");
+  }finally{
+    imageInput.value="";
+  }
+}
+
+function refreshModelHint(){
+  const typed=[commonModelSelect.value,...modelsInput.value.split(",").map((item)=>item.trim()).filter(Boolean),modelSelect.value].find((item)=>item);
+  if(!typed||!relayModels.length||relayModels.includes(typed)){modelHint.hidden=true;modelHint.textContent="";return}
+  modelHint.textContent=`「${typed}」没有出现在中转站返回的模型列表里。中转站页面上的显示名（例如带 2x 这类倍率标记）通常不是真正的模型 ID，请核对后重填。`;
+  modelHint.hidden=false;
+}
+
+async function refreshVisionCapability(){
+  try{
+    const response=await apiFetch("/api/config");
+    if(!response.ok)return;
+    const data=await response.json();
+    visionEnabled=Boolean(data.vision_input_enabled||data.vision_auto_supported);
+  }catch(error){
+    return;
+  }
+  refreshImageControls();
+}
+
+const DICTIONARY_TOKEN=/[A-Za-z][A-Za-z'\u2019-]{1,23}/g;
+const DICTIONARY_SINGLE=/^[A-Za-z][A-Za-z'\u2019-]{1,23}$/;
+const dictionaryCache=new Map();
+const dictionaryPending=new Map();
+let dictionaryCard=null;
+let dictionaryPointer=null;
+
+function dictionaryEnabled(){return localStorage.getItem("dictionary-enabled")!=="0"}
+function closeDictionaryCard(){if(dictionaryCard){dictionaryCard.remove();dictionaryCard=null}}
+
+function caretRangeAt(x,y){
+  if(document.caretRangeFromPoint)return document.caretRangeFromPoint(x,y);
+  const position=document.caretPositionFromPoint?document.caretPositionFromPoint(x,y):null;
+  if(!position||!position.offsetNode)return null;
+  const range=document.createRange();
+  range.setStart(position.offsetNode,position.offset);
+  range.collapse(true);
+  return range;
+}
+
+function wordAt(x,y){
+  const range=caretRangeAt(x,y);
+  if(!range)return null;
+  const node=range.startContainer;
+  if(!node||node.nodeType!==Node.TEXT_NODE||!node.parentElement)return null;
+  if(node.parentElement.closest("a,code,pre,button,.search-trace,.message-actions"))return null;
+  const message=node.parentElement.closest(".message.assistant .message-content");
+  if(!message)return null;
+  const text=node.textContent;
+  const offset=range.startOffset;
+  DICTIONARY_TOKEN.lastIndex=0;
+  let match;
+  while((match=DICTIONARY_TOKEN.exec(text))){
+    if(offset>=match.index&&offset<=match.index+match[0].length)return match[0];
+  }
+  return null;
+}
+
+function renderDictionaryCard(card,word,data){
+  const phonetic=card.querySelector(".dictionary-phonetic");
+  const list=card.querySelector(".dictionary-list");
+  if(!list)return;
+  if(phonetic)phonetic.textContent=data.phonetic?`/${data.phonetic}/`:"";
+  list.textContent="";
+  const senses=data.results||[];
+  if(!senses.length){
+    const empty=document.createElement("li");
+    empty.className="dictionary-empty";
+    empty.textContent=data.hint||"词典未收录该词";
+    list.append(empty);
+    return;
+  }
+  const base=String(data.query||"").toLowerCase();
+  if(base&&base!==word.toLowerCase()){
+    const note=document.createElement("li");
+    note.className="dictionary-base";
+    note.textContent=`原形：${base}`;
+    list.append(note);
+  }
+  for(const sense of senses){
+    const item=document.createElement("li");
+    if(sense.pos){
+      const tag=document.createElement("span");
+      tag.className="dictionary-pos";
+      tag.textContent=sense.pos;
+      item.append(tag);
+    }
+    const text=document.createElement("span");
+    text.className="dictionary-gloss";
+    text.textContent=sense.text;
+    item.append(text);
+    list.append(item);
+  }
+}
+
+function showDictionaryCard(word,x,y){
+  closeDictionaryCard();
+  const card=document.createElement("div");
+  card.className="dictionary-card";
+  card.setAttribute("role","dialog");
+  card.setAttribute("aria-label",`\u201c${word}\u201d的中文释义`);
+  const head=document.createElement("div");
+  head.className="dictionary-head";
+  const title=document.createElement("strong");
+  title.textContent=word;
+  const phonetic=document.createElement("span");
+  phonetic.className="dictionary-phonetic dictionary-loading";
+  phonetic.textContent="查询中";
+  head.append(title,phonetic);
+  const list=document.createElement("ul");
+  list.className="dictionary-list";
+  card.append(head,list);
+  document.body.append(card);
+  dictionaryCard=card;
+  positionDictionaryCard(card,x,y);
+  return card;
+}
+
+function positionDictionaryCard(card,x,y){
+  const gap=10;
+  const rect=card.getBoundingClientRect();
+  const left=Math.min(Math.max(gap,x-rect.width/2),Math.max(gap,window.innerWidth-rect.width-gap));
+  let top=y+gap;
+  if(top+rect.height>window.innerHeight-gap)top=Math.max(gap,y-rect.height-gap);
+  card.style.left=`${Math.round(left)}px`;
+  card.style.top=`${Math.round(top)}px`;
+}
+
+async function requestDictionary(word){
+  const key=word.toLowerCase();
+  if(dictionaryCache.has(key))return dictionaryCache.get(key);
+  if(dictionaryPending.has(key))return dictionaryPending.get(key);
+  const request=apiFetch("/api/dictionary",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({word:key})})
+    .then(async(response)=>{
+      const data=await response.json().catch(()=>({}));
+      if(!response.ok)throw new Error(data.error||"释义查询失败");
+      if(dictionaryCache.size>60)dictionaryCache.clear();
+      dictionaryCache.set(key,data);
+      return data;
+    })
+    .finally(()=>dictionaryPending.delete(key));
+  dictionaryPending.set(key,request);
+  return request;
+}
+
+function lookUpWord(word,x,y){
+  const clean=word.replace(/\u2019/g,"'");
+  const card=showDictionaryCard(clean,x,y);
+  requestDictionary(clean)
+    .then((data)=>{if(dictionaryCard===card)renderDictionaryCard(card,clean,data)})
+    .catch((error)=>{
+      if(dictionaryCard!==card)return;
+      const phonetic=card.querySelector(".dictionary-phonetic");
+      const list=card.querySelector(".dictionary-list");
+      if(!list)return;
+      if(phonetic)phonetic.textContent="";
+      list.textContent="";
+      const item=document.createElement("li");
+      item.className="dictionary-empty";
+      item.textContent=error.message;
+      list.append(item);
+    });
+}
+
+function selectedWord(){
+  const selection=window.getSelection?String(window.getSelection()):"";
+  const text=selection.trim();
+  return DICTIONARY_SINGLE.test(text)?text:"";
+}
+
 async function openConfigDialog(){
   let saved={};
   try{saved=JSON.parse(localStorage.getItem("chat-config")||"{}")}catch(error){console.error(error)}
@@ -346,13 +671,21 @@ async function openConfigDialog(){
   const commonValues=Array.from(commonModelSelect.options).map((option)=>option.value);
   commonModelSelect.value=commonValues.includes(saved.default_model)?saved.default_model:"";
   modelsInput.value=(saved.models||[]).filter((model)=>model!==commonModelSelect.value).join(", ");
+  webSearchInput.checked=Boolean(saved.web_search_enabled);
+  webSearchInput.dataset.savedState=webSearchInput.checked?"1":"0";
+  dictionaryToggleInput.checked=localStorage.getItem("dictionary-enabled")!=="0";
+  visionInput.checked=Boolean(saved.vision_input_enabled);
+  visionInput.dataset.savedState=visionInput.checked?"1":"0";
+  searchInput.checked=Boolean(saved.search_input_enabled);
+  searchInput.dataset.savedState=searchInput.checked?"1":"0";
+  refreshModelHint();
   configError.textContent="";
   configDialog.showModal();
 }
 
 async function saveConfig(){
-  const baseUrl=baseUrlInput.value.trim().replace(/\/$/,"");const apiKey=apiKeyInput.value.trim();const keyChanged=apiKey!==apiKeyDraft;const commonModel=commonModelSelect.value;const customModels=modelsInput.value.split(",").map((item)=>item.trim()).filter(Boolean);const models=commonModel?[commonModel,...customModels]:customModels;const defaultModel=commonModel||customModels[0]||modelSelect.value;const submitButton=configForm.querySelector("button[type='submit']");configError.textContent="";submitButton.disabled=true;submitButton.textContent="正在连接...";
-  try{const modelOnly=!keyChanged&&defaultModel&&baseUrl===baseUrlInput.dataset.savedValue;const payload=modelOnly?{model:defaultModel,models}:{base_url:baseUrl,models,default_model:defaultModel};if(keyChanged&&apiKey)payload.api_key=apiKey;const response=await apiFetch(modelOnly?"/api/config/model":"/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||"配置保存失败");localStorage.setItem("chat-config",JSON.stringify({baseUrl,models}));if(defaultModel)localStorage.setItem("chat-model",defaultModel);await loadModels(defaultModel||null);if(keyChanged)apiKeyDraft=apiKey;apiKeyInput.value=apiKeyDraft;return true}finally{apiKeyInput.type="password";apiKeyRevealButton.textContent="显示";submitButton.disabled=false;submitButton.textContent="保存并连接"}
+  const baseUrl=baseUrlInput.value.trim().replace(/\/$/,"");const apiKey=apiKeyInput.value.trim();const keyChanged=apiKey!==apiKeyDraft;const commonModel=commonModelSelect.value;const customModels=modelsInput.value.split(",").map((item)=>item.trim()).filter(Boolean);const models=commonModel?[commonModel,...customModels]:customModels;const defaultModel=commonModel||customModels[0]||modelSelect.value;const submitButton=configForm.querySelector("button[type='submit']");configError.textContent="";localStorage.setItem("dictionary-enabled",dictionaryToggleInput.checked?"1":"0");submitButton.disabled=true;submitButton.textContent="正在连接...";
+  try{const togglesChanged=[webSearchInput,visionInput,searchInput].some((box)=>box.checked!==(box.dataset.savedState==="1"));const modelOnly=!keyChanged&&!togglesChanged&&defaultModel&&baseUrl===baseUrlInput.dataset.savedValue;const payload=modelOnly?{model:defaultModel,models}:{base_url:baseUrl,models,default_model:defaultModel,web_search:webSearchInput.checked,vision_input:visionInput.checked,search_input:searchInput.checked};if(keyChanged&&apiKey)payload.api_key=apiKey;const response=await apiFetch(modelOnly?"/api/config/model":"/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||"配置保存失败");localStorage.setItem("chat-config",JSON.stringify({baseUrl,models}));if(defaultModel)localStorage.setItem("chat-model",defaultModel);await loadModels(defaultModel||null);await refreshVisionCapability();if(keyChanged)apiKeyDraft=apiKey;apiKeyInput.value=apiKeyDraft;return true}finally{apiKeyInput.type="password";apiKeyRevealButton.textContent="显示";submitButton.disabled=false;submitButton.textContent="保存并连接"}
 }
 
 async function toggleApiKeyVisibility(){
@@ -372,6 +705,51 @@ configForm.addEventListener("submit",async(event)=>{event.preventDefault();try{i
 configDialog.addEventListener("click",(event)=>{if(event.target===configDialog)configDialog.close()});
 configDialog.addEventListener("close",()=>{apiKeyInput.value="";apiKeyInput.type="password";apiKeyRevealButton.textContent="显示"});
 apiKeyRevealButton.addEventListener("click",toggleApiKeyVisibility);
+modelsInput.addEventListener("input",refreshModelHint);
+commonModelSelect.addEventListener("change",refreshModelHint);
+attachButton.addEventListener("click",()=>imageInput.click());
+imageInput.addEventListener("change",()=>attachImageFile(imageInput.files&&imageInput.files[0]));
+input.addEventListener("paste",(event)=>{
+  const items=event.clipboardData&&event.clipboardData.items;
+  if(!items)return;
+  for(const item of items){
+    if(item.kind==="file"&&((item.type||"").startsWith("image/")||/\.(png|jpe?g|webp)$/i.test(item.name||""))){
+      const file=item.getAsFile();
+      if(file){event.preventDefault();attachImageFile(file)}
+      return;
+    }
+  }
+});
+composer.addEventListener("dragover",(event)=>{event.preventDefault();if(visionEnabled)composer.classList.add("dragging")});
+composer.addEventListener("dragleave",()=>composer.classList.remove("dragging"));
+composer.addEventListener("drop",(event)=>{
+  event.preventDefault();
+  composer.classList.remove("dragging");
+  const file=event.dataTransfer&&event.dataTransfer.files&&event.dataTransfer.files[0];
+  attachImageFile(file);
+});
+
+messagesEl.addEventListener("pointerdown",(event)=>{dictionaryPointer={x:event.clientX,y:event.clientY}});
+messagesEl.addEventListener("click",(event)=>{
+  if(!dictionaryEnabled())return;
+  const origin=dictionaryPointer;
+  dictionaryPointer=null;
+  const dragged=Boolean(origin)&&(Math.abs(event.clientX-origin.x)>6||Math.abs(event.clientY-origin.y)>6);
+  if(dragged||selectedWord())return;
+  const word=wordAt(event.clientX,event.clientY);
+  if(!word){closeDictionaryCard();return}
+  lookUpWord(word,event.clientX,event.clientY);
+});
+messagesEl.addEventListener("dblclick",(event)=>{
+  if(!dictionaryEnabled())return;
+  const word=selectedWord()||wordAt(event.clientX,event.clientY);
+  if(word)lookUpWord(word,event.clientX,event.clientY);
+});
+document.addEventListener("click",(event)=>{if(dictionaryCard&&!dictionaryCard.contains(event.target))closeDictionaryCard()},true);
+document.addEventListener("keydown",(event)=>{if(event.key==="Escape")closeDictionaryCard()});
+chatScroll.addEventListener("scroll",closeDictionaryCard,{passive:true});
+window.addEventListener("resize",closeDictionaryCard);
+
 modelSelect.addEventListener("change",()=>{persistSelectedModel(modelSelect.value).catch((error)=>setStatus(error.message,"error"))});
 composer.addEventListener("submit",(event)=>{event.preventDefault();sendMessage()});
 input.addEventListener("keydown",(event)=>{if(event.key==="Enter"&&!event.shiftKey&&!event.isComposing){event.preventDefault();sendMessage()}else if(event.key==="Escape"&&isGenerating)stopGeneration()});
@@ -385,7 +763,7 @@ loginForm.addEventListener("submit",async(event)=>{event.preventDefault();loginE
 logoutButton.addEventListener("click",async()=>{await fetch("/api/logout",{method:"POST"}).catch(console.error);showLogin()});
 document.querySelectorAll(".suggestion").forEach((button)=>button.addEventListener("click",()=>{input.value=button.dataset.prompt||"";input.dispatchEvent(new Event("input"));input.focus()}));
 
-async function initializeApp(){updateEmptyState();setModelPlaceholder("连接中转站");await Promise.all([loadConversations(),loadModels()])}
+async function initializeApp(){updateEmptyState();setModelPlaceholder("连接中转站");await Promise.all([loadConversations(),loadModels(),refreshVisionCapability()])}
 async function startApp(){
   if("serviceWorker" in navigator)navigator.serviceWorker.register("/sw.js").catch(console.error);
   const oldConfig=localStorage.getItem("chat-config");

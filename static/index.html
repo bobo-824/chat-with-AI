@@ -57,7 +57,8 @@
       </section>
 
       <div class="composer-area">
-        <form id="composer" class="composer"><textarea id="input" rows="1" placeholder="给 AI Chat 发送消息" aria-label="消息" required></textarea><button class="send-button" type="submit" aria-label="发送消息"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M6.5 10.5 12 5l5.5 5.5"/></svg></button></form>
+        <div class="attachments" id="attachments" hidden></div>
+        <form id="composer" class="composer"><input id="image-input" type="file" accept="image/png,image/jpeg,image/webp" hidden><button class="attach-button" id="attach-image" type="button" aria-label="添加图片" title="添加图片（支持粘贴或拖拽）" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11.5 12.2 19.3a4.5 4.5 0 0 1-6.4-6.4l8.1-8.1a3 3 0 0 1 4.3 4.2l-8.1 8.1a1.5 1.5 0 0 1-2.1-2.1l7.1-7.1"/></svg></button><textarea id="input" rows="1" placeholder="给 AI Chat 发送消息" aria-label="消息" required></textarea><button class="send-button" type="submit" aria-label="发送消息"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M6.5 10.5 12 5l5.5 5.5"/></svg></button></form>
         <p class="chat-status" id="chat-status" role="status" aria-live="polite"></p>
         <p class="disclaimer">AI 可能会犯错，请核查重要信息。</p>
       </div>
@@ -70,7 +71,11 @@
       <label class="field"><span>API URL</span><input id="base-url" type="url" placeholder="https://relay.example.com/v1" autocomplete="off" required></label>
       <label class="field"><span>API Key</span><div class="secret-input"><input id="api-key" type="password" placeholder="sk-..." autocomplete="off"><button id="api-key-reveal" type="button" aria-label="显示 API Key">显示</button></div><small>已保存的 Key 可留空。只有点击“显示”时，Key 才会读取到当前页面。</small></label>
       <label class="field"><span>常用模型</span><select id="common-model"><option value="">选择一个常用模型（可选）</option><option value="gpt-4o">GPT-4o</option><option value="gpt-4o-mini">GPT-4o mini</option><option value="gpt-4.1">GPT-4.1</option><option value="gpt-4.1-mini">GPT-4.1 mini</option><option value="claude-3-7-sonnet-latest">Claude 3.7 Sonnet</option><option value="gemini-2.5-pro">Gemini 2.5 Pro</option><option value="deepseek-chat">DeepSeek Chat</option><option value="qwen-plus">Qwen Plus</option><option value="glm-4.5">GLM-4.5</option></select></label>
-      <label class="field"><span>自定义模型名称</span><input id="models" placeholder="model-a, model-b（可选）" autocomplete="off"><small>中转站无法返回模型列表时，可手动填写多个模型。常用模型也可以与自定义名称一起使用。</small></label>
+      <label class="field"><span>自定义模型名称</span><input id="models" placeholder="model-a, model-b（可选）" autocomplete="off"><small>中转站无法返回模型列表时，可手动填写多个模型。常用模型也可以与自定义名称一起使用。</small><small id="model-hint" hidden></small></label>
+      <label class="field checkbox-field"><input id="web-search" type="checkbox"><span>允许 Claude 联网搜索（单条消息最多 3 次）<small>开启后模型可在回答前检索公开网页，提问内容会经由服务端搜索工具发出；搜索词与来源链接显示在回复下方。</small></span></label>
+<label class="field checkbox-field"><input id="search-input" type="checkbox"><span>该模型支持联网搜索<small>中转站常把 Claude 改名成 gpt-pro-稳定 这类别名，此时自动识别会失效。勾选后即使模型名不含 claude 也会走原生搜索通道；若该模型其实不支持，服务会自动退回普通对话并提示，不会报错。</small></span></label>
+      <label class="field checkbox-field"><input id="dictionary-enabled" type="checkbox"><span>点击英文单词查释义<small>点击 AI 回复里的英文单词，显示本地词库的中文释义。词库来自开源项目 ECDICT，查询只发生在本机与本地服务之间。</small></span></label>
+      <label class="field checkbox-field"><input id="vision-input" type="checkbox"><span>允许图片输入<small>开启后可以给消息附一张图片（选图、粘贴或拖拽都可以），发送前会在浏览器里压到 1MB 以内并去掉照片自带的位置信息。常见多模态模型会自动识别，识别不到时再手动勾选。</small></span></label>
       <p class="form-error" id="config-error" role="alert"></p>
       <div class="dialog-actions"><button class="secondary-button" type="button" id="config-cancel">取消</button><button class="primary-button" type="submit">保存并连接</button></div>
     </form>

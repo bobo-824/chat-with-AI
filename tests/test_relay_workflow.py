@@ -14,12 +14,45 @@ import server
 
 
 SECRET_ECHO_KEY = "sk-echoed-relay-key-1234567890"
+RELAY_TEST_TIMEOUT_SECONDS = 15
+WEB_SEARCH_RESULT_BLOCK = "web_search_tool_result"
 
+ANTHROPIC_SEARCH_EVENTS = [
+    {"type": "message_start", "message": {"id": "msg_search", "role": "assistant", "content": []}},
+    {"type": "content_block_start", "index": 0, "content_block": {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {}}},
+    {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\x22query\x22: \x22Shang"}},
+    {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "hai date today\x22}"}},
+    {"type": "content_block_stop", "index": 0},
+    {"type": "content_block_start", "index": 1, "content_block": {"type": WEB_SEARCH_RESULT_BLOCK, "tool_use_id": "srvtoolu_1", "content": [
+        {"type": "web_search_result", "url": "https://time.is/Shanghai", "title": "Time.is", "encrypted_content": "opaque-search-payload"},
+        {"type": "web_search_result", "url": "https://example.com/time", "title": "relay-secret time page"},
+    ]}},
+    {"type": "content_block_stop", "index": 1},
+    {"type": "ping"},
+    {"type": "content_block_start", "index": 2, "content_block": {"type": "text", "text": ""}},
+    {"type": "content_block_delta", "index": 2, "delta": {"type": "text_delta", "text": "Today is "}},
+    {"type": "content_block_delta", "index": 2, "delta": {"type": "text_delta", "text": "2026-09-30."}},
+    {"type": "content_block_stop", "index": 2},
+    {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 12}},
+    {"type": "message_stop"},
+]
+
+
+WEB_SEARCH_DELTAS = [
+    {"tool_calls": [{"index": 0, "id": "srvtoolu_1", "type": "function", "function": {"name": "web_search", "arguments": "{\"que"}}]},
+    {"tool_calls": [{"index": 0, "function": {"arguments": "ry\": \"Shanghai date today\"}"}}]},
+    {"content": "Today is "},
+    {"content": "2026-09-30."},
+    {"annotations": [{"type": "url_citation", "url_citation": {"url": "https://example.com/time", "title": "relay-secret time page"}}]},
+    {"web_search_tool_result": {"content": [{"type": "web_search_result", "url": "https://time.is/Shanghai", "title": "Time.is"}]}},
+]
 
 class MockRelayHandler(BaseHTTPRequestHandler):
     requests = []
     fail_models = False
     fail_chat = False
+    search_reply = False
+    native_search_reply = False
 
     def do_GET(self):
         self.__class__.requests.append((self.command, self.path, self.headers.get("Authorization")))
@@ -34,7 +67,24 @@ class MockRelayHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length).decode("utf-8")
-        self.__class__.requests.append((self.command, self.path, self.headers.get("Authorization"), body))
+        self.__class__.requests.append(
+            (self.command, self.path, self.headers.get("Authorization"), body, self.headers.get("x-api-key"))
+        )
+        if self.path == "/v1/messages":
+            if not self.__class__.native_search_reply:
+                self.send_json(404, {"type": "error", "error": {"type": "not_found_error", "message": "messages endpoint disabled"}})
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            for event in ANTHROPIC_SEARCH_EVENTS:
+                frame = f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
+                self.wfile.write(frame.encode("utf-8"))
+            self.wfile.flush()
+            return
         if self.path != "/v1/chat/completions":
             self.send_json(404, {"error": "not found"})
             return
@@ -47,6 +97,24 @@ class MockRelayHandler(BaseHTTPRequestHandler):
                     "echo": {"authorization": self.headers.get("Authorization")},
                 },
             )
+            return
+
+        if self.__class__.search_reply:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            for delta in WEB_SEARCH_DELTAS:
+                payload = {
+                    "id": "chatcmpl-search",
+                    "object": "chat.completion.chunk",
+                    "created": 1_700_000_000,
+                    "model": "relay-reported-model",
+                    "choices": [{"delta": delta, "index": 0}],
+                }
+                self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode("utf-8"))
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
             return
 
         self.send_response(200)
@@ -83,11 +151,15 @@ class MockRelayHandler(BaseHTTPRequestHandler):
         pass
 
 
-class RelayWorkflowTest(unittest.TestCase):
+class RelayTestHarness(unittest.TestCase):
+    """A real app server plus a mock OpenAI-compatible relay on throwaway files."""
+
     def setUp(self):
         MockRelayHandler.requests = []
         MockRelayHandler.fail_models = False
         MockRelayHandler.fail_chat = False
+        MockRelayHandler.search_reply = False
+        MockRelayHandler.native_search_reply = False
         self.relay = ThreadingHTTPServer(("127.0.0.1", 0), MockRelayHandler)
         self.relay_thread = threading.Thread(target=self.relay.serve_forever, daemon=True)
         self.relay_thread.start()
@@ -118,8 +190,9 @@ class RelayWorkflowTest(unittest.TestCase):
         request_headers = {"Content-Type": "application/json"} if body else {}
         request_headers.update(headers or {})
         request = Request(self.base_url + path, data=body, method=method, headers=request_headers)
-        return urlopen(request, timeout=5)
+        return urlopen(request, timeout=RELAY_TEST_TIMEOUT_SECONDS)
 
+class RelayWorkflowTest(RelayTestHarness):
     def test_models_stream_and_history(self):
         with self.request(
             "/api/config",
@@ -540,6 +613,283 @@ class RelayWorkflowTest(unittest.TestCase):
         chat_requests = [item for item in MockRelayHandler.requests if item[0] == "POST"]
         self.assertEqual(chat_requests[-1][2], f"Bearer {SECRET_ECHO_KEY}")
 
+class WebSearchRelayTest(RelayTestHarness):
+    """The toggle must never put an Anthropic-only tool into an OpenAI-format request."""
+
+    CLAUDE_MODEL = "claude-relay-model"
+
+    def configure(self, web_search, model="claude-relay-model"):
+        with self.request(
+            "/api/config",
+            "POST",
+            {
+                "api_key": "relay-secret",
+                "base_url": f"http://127.0.0.1:{self.relay.server_address[1]}/v1",
+                "models": [model],
+                "web_search": web_search,
+            },
+        ) as response:
+            self.assertEqual(response.status, 200)
+
+    def chat(self, model="claude-relay-model"):
+        with self.request(
+            "/api/chat",
+            "POST",
+            {"messages": [{"role": "user", "content": "What is today's date in Shanghai?"}], "model": model},
+        ) as response:
+            stream = response.read().decode("utf-8")
+        return [
+            json.loads(part[5:].strip())
+            for part in stream.split("\n\n")
+            if part.startswith("data:") and "[DONE]" not in part
+        ]
+
+    def relay_chat_bodies(self):
+        return [
+            json.loads(item[3])
+            for item in MockRelayHandler.requests
+            if item[0] == "POST" and item[1] == "/v1/chat/completions"
+        ]
+
+    def native_bodies(self):
+        return [
+            json.loads(item[3])
+            for item in MockRelayHandler.requests
+            if item[0] == "POST" and item[1] == "/v1/messages"
+        ]
+
+    def native_keys(self):
+        return [item[4] for item in MockRelayHandler.requests if item[1] == "/v1/messages"]
+
+    def test_declaration_matches_the_anthropic_web_search_contract(self):
+        declaration = server.web_search_tool_declaration()
+        self.assertEqual(declaration, {"type": "web_search_20260209", "name": "web_search", "max_uses": 3})
+
+    def test_declaration_is_omitted_when_the_switch_is_off(self):
+        self.configure(False)
+        self.chat()
+        self.assertNotIn("tools", self.relay_chat_bodies()[0])
+        self.assertEqual(self.native_bodies(), [])
+
+    def test_anthropic_tool_never_travels_in_the_openai_request(self):
+        self.configure(True, model="relay-model")
+        events = self.chat(model="relay-model")
+        self.assertNotIn("tools", self.relay_chat_bodies()[0])
+        notices = [event["notice"] for event in events if "notice" in event]
+        self.assertEqual(notices, [server.NATIVE_SEARCH_UNSUPPORTED_MODEL_NOTICE])
+
+    def test_search_on_claude_uses_the_native_messages_endpoint(self):
+        self.configure(True)
+        MockRelayHandler.native_search_reply = True
+        self.chat()
+        self.assertEqual(self.relay_chat_bodies(), [])
+        body = self.native_bodies()[0]
+        self.assertEqual(body["tools"], [server.web_search_tool_declaration()])
+        self.assertTrue(body["stream"])
+        self.assertEqual(body["model"], self.CLAUDE_MODEL)
+        self.assertEqual(self.native_keys(), ["relay-secret"])
+
+    def test_native_stream_preserves_text_queries_and_citations(self):
+        self.configure(True)
+        MockRelayHandler.native_search_reply = True
+        events = self.chat()
+        self.assertEqual("".join(event.get("content", "") for event in events), "Today is 2026-09-30.")
+        self.assertEqual(
+            [event["search"]["query"] for event in events if "search" in event],
+            ["Shanghai date today"],
+        )
+        self.assertEqual(
+            [source["url"] for event in events for source in event.get("sources", [])],
+            ["https://time.is/Shanghai", "https://example.com/time"],
+        )
+        self.assertEqual([event for event in events if "notice" in event], [])
+
+    def test_native_search_persists_metadata_without_leaking_secrets(self):
+        self.configure(True)
+        MockRelayHandler.native_search_reply = True
+        events = self.chat()
+        stream = json.dumps(events)
+        self.assertNotIn("relay-secret", stream)
+        self.assertNotIn("opaque-search-payload", stream)
+        self.assertIn("[REDACTED]", stream)
+        conversations = server.Handler.chat_server.conversations.list_conversations()
+        history = server.Handler.chat_server.conversations.get_conversation(conversations[0]["id"])["messages"]
+        assistant = history[-1]
+        self.assertEqual(assistant["content"], "Today is 2026-09-30.")
+        self.assertEqual(assistant["search"], ["Shanghai date today"])
+        self.assertEqual(
+            [source["url"] for source in assistant["sources"]],
+            ["https://time.is/Shanghai", "https://example.com/time"],
+        )
+        self.assertNotIn("relay-secret", json.dumps(history))
+
+    def test_native_history_is_projected_back_to_role_and_content(self):
+        self.configure(True)
+        MockRelayHandler.native_search_reply = True
+        self.chat()
+        self.chat()
+        body = self.native_bodies()[-1]
+        self.assertTrue(
+            all(set(message) == {"role", "content"} for message in body["messages"]),
+            body["messages"],
+        )
+
+    def test_missing_native_endpoint_falls_back_without_breaking_chat(self):
+        self.configure(True)
+        MockRelayHandler.native_search_reply = False
+        events = self.chat()
+        notices = [event["notice"] for event in events if "notice" in event]
+        self.assertEqual(notices, [server.NATIVE_SEARCH_UNAVAILABLE_NOTICE])
+        self.assertEqual("".join(event.get("content", "") for event in events), "Hello from relay")
+        self.assertNotIn("tools", self.relay_chat_bodies()[0])
+
+    def test_switch_rejects_non_boolean_values(self):
+        with self.assertRaises(HTTPError) as raised:
+            self.request(
+                "/api/config",
+                "POST",
+                {
+                    "api_key": "relay-secret",
+                    "base_url": f"http://127.0.0.1:{self.relay.server_address[1]}/v1",
+                    "models": ["relay-model"],
+                    "web_search": "yes please",
+                },
+            ).__enter__()
+        self.assertEqual(raised.exception.code, 400)
+
+    def test_switch_survives_a_model_only_save_and_a_restart(self):
+        self.configure(True)
+        with self.request("/api/config/model", "POST", {"model": "relay-model", "models": ["relay-model"]}) as response:
+            self.assertEqual(response.status, 200)
+        with self.request("/api/config") as response:
+            self.assertTrue(json.loads(response.read())["web_search_enabled"])
+        restarted = server.ChatServer(app_password="", config_path=self.config_path)
+        self.assertTrue(restarted.web_search_enabled)
+
+
+class OpenAIFormatSearchHarvestTest(RelayTestHarness):
+    """A relay that surfaces search results in OpenAI-format chunks is still harvested."""
+
+    def configure(self, web_search):
+        with self.request(
+            "/api/config",
+            "POST",
+            {
+                "api_key": "relay-secret",
+                "base_url": f"http://127.0.0.1:{self.relay.server_address[1]}/v1",
+                "models": ["relay-model"],
+                "web_search": web_search,
+            },
+        ) as response:
+            self.assertEqual(response.status, 200)
+
+    def chat(self):
+        with self.request(
+            "/api/chat",
+            "POST",
+            {"messages": [{"role": "user", "content": "What is today's date in Shanghai?"}], "model": "relay-model"},
+        ) as response:
+            stream = response.read().decode("utf-8")
+        return [
+            json.loads(part[5:].strip())
+            for part in stream.split("\n\n")
+            if part.startswith("data:") and "[DONE]" not in part
+        ]
+
+    def relay_chat_bodies(self):
+        return [
+            json.loads(item[3])
+            for item in MockRelayHandler.requests
+            if item[0] == "POST" and item[1] == "/v1/chat/completions"
+        ]
+
+    def test_final_text_queries_and_citations_all_survive_the_stream(self):
+        self.configure(True)
+        MockRelayHandler.search_reply = True
+        events = self.chat()
+        self.assertEqual("".join(event.get("content", "") for event in events), "Today is 2026-09-30.")
+        self.assertEqual(
+            [event["search"]["query"] for event in events if "search" in event],
+            ["Shanghai date today"],
+        )
+        self.assertEqual(
+            [source["url"] for event in events for source in event.get("sources", [])],
+            ["https://example.com/time", "https://time.is/Shanghai"],
+        )
+
+    def test_search_metadata_is_persisted_without_leaking_the_key(self):
+        self.configure(True)
+        MockRelayHandler.search_reply = True
+        events = self.chat()
+        stream = json.dumps(events)
+        self.assertNotIn("relay-secret", stream)
+        self.assertIn("[REDACTED]", stream)
+        conversations = server.Handler.chat_server.conversations.list_conversations()
+        history = server.Handler.chat_server.conversations.get_conversation(conversations[0]["id"])["messages"]
+        assistant = history[-1]
+        self.assertEqual(assistant["content"], "Today is 2026-09-30.")
+        self.assertEqual(assistant["search"], ["Shanghai date today"])
+        self.assertNotIn("relay-secret", json.dumps(history))
+
+    def test_history_is_projected_back_to_role_and_content(self):
+        self.configure(True)
+        self.chat()
+        body = self.relay_chat_bodies()[-1]
+        self.assertTrue(
+            all(set(message) == {"role", "content"} for message in body["messages"]),
+            body["messages"],
+        )
+
+
+class AnthropicStreamTranslationTest(unittest.TestCase):
+    """Unit coverage for the native SSE reader used by the search transport."""
+
+    def test_the_native_client_is_reused(self):
+        self.assertIs(server.native_client(), server.native_client())
+
+    def test_endpoint_is_derived_from_the_openai_base_url(self):
+        self.assertEqual(server.anthropic_messages_endpoint("https://relay.example/v1"), "https://relay.example/v1/messages")
+        self.assertEqual(server.anthropic_messages_endpoint("https://relay.example/v1/"), "https://relay.example/v1/messages")
+        self.assertEqual(server.anthropic_messages_endpoint("https://relay.example"), "https://relay.example/v1/messages")
+        self.assertEqual(
+            server.anthropic_messages_endpoint("https://relay.example/v1/messages"),
+            "https://relay.example/v1/messages",
+        )
+
+    def test_reassembled_input_json_yields_one_query_and_deduped_sources(self):
+        events = list(server.translate_anthropic_stream(iter(ANTHROPIC_SEARCH_EVENTS), "relay-secret"))
+        self.assertEqual([event["search"]["query"] for event in events if "search" in event], ["Shanghai date today"])
+        self.assertEqual(
+            [source["url"] for event in events for source in event.get("sources", [])],
+            ["https://time.is/Shanghai", "https://example.com/time"],
+        )
+        self.assertNotIn("relay-secret", json.dumps(events))
+
+    def test_translation_stops_at_message_stop(self):
+        consumed = []
+
+        def events():
+            for event in ANTHROPIC_SEARCH_EVENTS:
+                consumed.append(event["type"])
+                yield event
+            yield {"type": "content_block_start", "index": 9, "content_block": {"type": "text", "text": "never"}}
+
+        translated = list(server.translate_anthropic_stream(events(), ""))
+        self.assertNotIn("never", json.dumps(translated))
+        self.assertEqual(consumed[-1], "message_stop")
+
+    def test_error_events_become_a_native_search_failure(self):
+        with self.assertRaises(server.NativeSearchUnavailable):
+            list(server.translate_anthropic_stream(iter([{"type": "error", "error": {"type": "overloaded_error", "message": "busy"}}]), ""))
+
+    def test_non_json_and_comment_lines_are_skipped(self):
+        parsed = list(server.iter_anthropic_events(iter([": ping", "event: message_stop", "data: {broken", "data: [DONE]", ""])))
+        self.assertEqual(parsed, [])
+
+    def test_only_claude_models_take_the_native_path(self):
+        self.assertTrue(server.model_supports_native_search("Claude-Opus-4-8"))
+        self.assertFalse(server.model_supports_native_search("gpt-5.6-sol"))
+        self.assertFalse(server.model_supports_native_search(""))
 
 if __name__ == "__main__":
     unittest.main()

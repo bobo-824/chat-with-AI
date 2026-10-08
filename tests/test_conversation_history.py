@@ -116,7 +116,7 @@ class ConversationHistoryTest(unittest.TestCase):
         chat_server = server.ChatServer(app_password="")
         chat_server.conversations = self.store
 
-        def fail_stream(messages, model):
+        def fail_stream(messages, model, web_search=False):
             raise RuntimeError("relay unavailable")
             yield
 
@@ -138,7 +138,7 @@ class ConversationHistoryTest(unittest.TestCase):
         chat_server = server.ChatServer(app_password="")
         chat_server.conversations = self.store
 
-        def partial_stream(messages, model):
+        def partial_stream(messages, model, web_search=False):
             yield {"content": "Partial answer"}
             raise RuntimeError("connection dropped")
 
