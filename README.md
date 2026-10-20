@@ -79,10 +79,10 @@ python server.py
 
 设置对话框里的四个字段：
 
-- **API URL**：OpenAI 兼容接口的基础地址。只允许 `http://` 或 `https://`，不能包含用户名密码；不能指向链路本地、组播、保留或 IPv6 唯一本地地址（云元数据服务地址会被拒绝）。本机与局域网地址（`127.0.0.1`、`192.168.x.x`、`localhost`、`*.local`）不受影响，因此 Ollama、LM Studio 可以正常使用。
+- **API URL**：OpenAI 兼容接口的基础地址。只允许 `http://` 或 `https://`，不能包含用户名密码；不能指向链路本地、组播、保留或 IPv6 唯一本地地址（云元数据服务地址会被拒绝）。本机与局域网地址（`127.0.0.1`、`192.168.x.x`、`localhost`、`*.local`）不受影响，因此 Ollama、LM Studio 可以正常使用。结尾少了 `/v1` 会自动补全（粘贴网关首页 `https://relay.example.com` 也能直接用）；已经带 `/v1`、或粘贴的是完整端点（`…/v1/chat/completions`）时按本意保留或剥回基础地址。Ollama、LM Studio 等本地服务通常以 `/v1` 结尾，补全规则同样适用。
 - **API Key**：只写入服务端。留空保存表示“保留已保存的 Key，只改地址或模型”。Key 只能包含 ASCII 字符——如果从聊天工具里复制时带上了中文标签或全角空格，会直接报错并提示重新复制。
 - **模型**：应用会先请求中转站的模型列表，与手动填写的模型合并去重；模型接口暂时不可用时，使用上一次成功获取的列表或手动模型。
-- **允许 Claude 联网搜索**：勾选后本机会改用中转站的**原生 Anthropic Messages 接口**（把 API URL 末尾的 `/v1` 换成 `/v1/messages`）发请求，请求体里带服务端工具 `web_search_20260209`（`max_uses=3`），回复下方的搜索词与来源链接（citations）来自原生流事件；只有 Claude 模型支持，模型名不含 `claude` 或未勾选时继续走原来的 OpenAI 兼容接口且**完全不带 `tools`**（中转站的 OpenAI 兼容层承载不了 Anthropic 服务端工具，硬塞会被网关拒绝）。若中转站没有 `/v1/messages`，会自动退回普通对话并在状态栏提示。搜索词与来源随对话写入本地 `chat-history.json`。
+- **允许 Claude 联网搜索**：勾选后本机会改用中转站的**原生 Anthropic Messages 接口**（把 API URL 末尾的 `/v1` 换成 `/v1/messages`）发请求，请求体里带服务端工具 `web_search_20260209`（`max_uses=3`），回复下方的搜索词与来源链接（citations）来自原生流事件；只有 Claude 模型支持，模型名不含 `claude` 或未勾选时继续走原来的 OpenAI 兼容接口且**完全不带 `tools`**（中转站的 OpenAI 兼容层承载不了 Anthropic 服务端工具，硬塞会被网关拒绝）。原生通道本轮失败时会自动退回普通对话，并在状态栏提示**真实失败原因**（例如 `HTTP 404` 说明中转站没有 `/v1/messages`，`HTTP 400/500` 说明该模型不支持搜索工具），不会把错误吞掉。搜索词与来源随对话写入本地 `chat-history.json`。
 
 也可以用环境变量提供同样的信息（环境变量优先于本机保存的配置）：
 
@@ -194,7 +194,7 @@ python server.py
 CC Switch 不在这条链路上：它的本地代理把 Claude Code 的 Anthropic 请求转换成 OpenAI 格式，方向正好相反，因此不能靠它补上 Anthropic 服务端工具。
 
 **点击单词提示“词典未收录该词”**
-随项目提交的 `data/dict-en-zh.json` 是从 ECDICT 生成的 2 万条常用词，专业词、生僻词和词组不在其中。需要完整词库时（约 66MB，不入库）：
+随项目提交的 `data/dict-en-zh.json` 是从 ECDICT 生成的 2 万条常用词，按词频与牛津/Collins 星级挑选，`[计]`、`[医]` 等专业标签释义**包含在内**；超出选词名额的生僻缩写（如 `api`，词频排名 4.6 万）和词组不在其中。需要完整词库时（约 66MB，不入库）：
 
 ```powershell
 curl.exe -L -o data\ecdict.csv https://raw.githubusercontent.com/skywind3000/ECDICT/master/ecdict.csv

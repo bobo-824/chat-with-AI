@@ -247,7 +247,19 @@ class DictionaryBuilderTest(unittest.TestCase):
         senses = self.builder.clean_senses(
             "n. \u8bed\u8a00, \u6587\u5b57\n[\u8ba1] \u8bed\u8a00\u7f16\u7a0b\nvt. \u8868\u8fbe, \u4f20\u8fbe\nn. \u6c11\u65cf"
         )
-        self.assertEqual(senses, ["n. \u8bed\u8a00, \u6587\u5b57", "vt. \u8868\u8fbe, \u4f20\u8fbe", "n. \u6c11\u65cf"])
+        self.assertEqual(
+            senses,
+            ["n. \u8bed\u8a00, \u6587\u5b57", "[\u8ba1] \u8bed\u8a00\u7f16\u7a0b", "vt. \u8868\u8fbe, \u4f20\u8fbe", "n. \u6c11\u65cf"],
+        )
+
+    def test_domain_tagged_senses_survive_inflection_notes_drop(self):
+        # ECDICT \u7528 [\u8ba1]/[\u533b] \u8fd9\u7c7b\u6807\u7b7e\u7ed9\u4e13\u4e1a\u91ca\u4e49\uff1b\u8fd9\u7c7b\u884c\u5fc5\u987b\u4fdd\u7559\u3002
+        # \u201c\u7684\u8fc7\u53bb\u5f0f/\u7684\u590d\u6570\u201d\u8fd9\u7c7b\u8bcd\u5f62\u8bf4\u660e\u4ecd\u7136\u4e22\u5f03\u3002
+        self.assertEqual(
+            self.builder.clean_senses("[\u533b] \u6025\u6027\u7126\u8651\u53d1\u4f5c\n\n"),
+            ["[\u533b] \u6025\u6027\u7126\u8651\u53d1\u4f5c"],
+        )
+        self.assertEqual(self.builder.clean_senses("go \u7684\u8fc7\u53bb\u5f0f"), [])
 
     def test_inflection_codes_are_read(self):
         forms = self.builder.inflected_forms("p:went/d:gone/i:going/3:goes/s:goses")
@@ -288,13 +300,17 @@ class DictionaryBuilderTest(unittest.TestCase):
             newline="\n",
         )
         rows = self.builder.load_rows(source)
-        self.assertEqual(sorted(row["word"] for row in rows), ["go", "water"])
+        # \u65e0\u8bcd\u9891\u7684\u8bcd\uff08qqzzxw\uff09\u4e0d\u518d\u88ab\u6574\u8bcd\u4e22\u5f03\uff0c\u53ea\u662f\u6392\u5e8f\u9760\u540e\u3002
+        self.assertEqual(sorted(row["word"] for row in rows), ["go", "qqzzxw", "water"])
         payload = self.builder.build(rows, 0)
-        self.assertEqual(payload["words"]["go"], ["vi. \u53bb, \u6267\u884c"])
+        self.assertEqual(payload["words"]["go"], ["vi. \u53bb, \u6267\u884c", "[\u8ba1] \u8df3\u8f6c"])
+        self.assertEqual(payload["words"]["water"], ["n. \u6c34, \u6c34\u91cf", "[\u5316] \u6c27\u5316\u7269"])
         self.assertEqual(payload["phonetics"]["go"], "gou")
         self.assertEqual(payload["inflections"]["went"], "go")
         self.assertNotIn("many words here", payload["words"])
-        self.assertNotIn("qqzzxw", payload["words"])
+        self.assertIn("qqzzxw", payload["words"])
+        # \u540d\u989d\u4e0d\u591f\u65f6\uff0c\u6709\u8bcd\u9891\u7684\u8bcd\u4f18\u5148\uff0c\u65e0\u8bcd\u9891\u7684\u8bcd\u88ab\u6324\u51fa\u3002
+        self.assertEqual(sorted(self.builder.build(rows, 2)["words"]), ["go", "water"])
         target = self.directory / "out.json"
         self.builder.dump(payload, target)
         reloaded = json.loads(target.read_text(encoding="utf-8"))
@@ -373,6 +389,29 @@ class BundledDictionaryTest(unittest.TestCase):
         for form, base in inflections.items():
             self.assertTrue(server.DICTIONARY_INDEX_WORD_PATTERN.match(form), form)
             self.assertTrue(server.DICTIONARY_INDEX_WORD_PATTERN.match(base), base)
+
+    def test_bundled_dictionary_keeps_domain_tagged_senses(self):
+        """ECDICT 把专业释义挂在 [计] / [医] / [人名] 这类标签行上。
+
+        构建脚本早期版本丢弃一切 "^[" 开头的行，于是 api、acl 这种只剩标签释义的
+        词整条消失——用户点词时看到"未收录"。这里锁定标签行不再被误杀。
+        """
+        payload = json.loads(BUNDLED_DICTIONARY.read_text(encoding="utf-8"))
+        tag = re.compile(r"^\[[^\]]{1,8}\]")
+        tagged = {
+            word
+            for word, senses in payload["words"].items()
+            if any(tag.match(sense) for sense in senses)
+        }
+        self.assertGreaterEqual(len(tagged), 1000, "domain-tagged senses were dropped again")
+        store = server.DictionaryStore(BUNDLED_DICTIONARY)
+        for word in sorted(tagged)[:25]:
+            results = store.lookup(word)["results"]
+            self.assertTrue(results, word)
+            self.assertTrue(
+                any(tag.match(sense["text"]) for sense in results),
+                f"{word} kept the word but lost its tagged gloss",
+            )
 
     def test_bundled_dictionary_size_is_bounded(self):
         self.assertLess(BUNDLED_DICTIONARY.stat().st_size, 8 * 1024 * 1024)

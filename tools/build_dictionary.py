@@ -18,11 +18,16 @@ from pathlib import Path
 WORD_PATTERN = re.compile(r"^[A-Za-z][A-Za-z]{0,23}$")
 POS_PATTERN = re.compile(r"^([A-Za-z]{1,9}\.)\s*(.+)$")
 INFLECTION_CODES = {"p", "d", "i", "s", "r", "t", "3"}
+# ECDICT 给专业词汇的释义常以 [计] / [医] / [人名] 这类领域标签开头。
+# 以前这里丢弃一切 "^[" 开头的行，把 api、acl 这种词的中文释义整条误杀；
+# 现在只丢词形变化说明（"的过去式"等），领域标签行保留下来。
 DROP_PATTERNS = (
-    re.compile(r"^\["),
     re.compile(r"^\s*$"),
     re.compile(r"的过去式|的过去分词|的现在分词|的复数|的比较级|的最高级"),
 )
+# 没有 frq/bnc 词频的词不再被整词丢弃，而是记作超大排名，排在所有有词频的词之后。
+# 这样 2 万规模时仍以常用词优先，--limit 放大时专业词和生僻词能自然补位。
+UNRANKED_RANK = 10 ** 9
 MAX_SENSES = 4
 MAX_SENSE_LENGTH = 90
 
@@ -80,15 +85,13 @@ def load_rows(source):
             if not WORD_PATTERN.match(word):
                 continue
             rank = frequency_rank(row)
-            if rank is None:
-                continue
             senses = clean_senses(row.get("translation"))
             if not senses:
                 continue
             rows.append(
                 {
                     "word": word.lower(),
-                    "rank": rank,
+                    "rank": UNRANKED_RANK if rank is None else rank,
                     "senses": senses,
                     "phonetic": re.sub(r"\s+", " ", (row.get("phonetic") or "").strip())[:48],
                     "forms": inflected_forms(row.get("exchange")),

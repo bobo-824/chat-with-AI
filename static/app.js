@@ -37,6 +37,15 @@ const commonModelSelect=document.getElementById("common-model");
 const configError=document.getElementById("config-error");
 const configCancelButton=document.getElementById("config-cancel");
 const configCloseButton=document.getElementById("config-close");
+const promptGuideButton=document.getElementById("prompt-guide");
+const promptGuideDialog=document.getElementById("prompt-guide-dialog");
+const promptGuideForm=document.getElementById("prompt-guide-form");
+const promptGuideText=document.getElementById("prompt-guide-text");
+const promptGuideMeta=document.getElementById("prompt-guide-meta");
+const promptGuideError=document.getElementById("prompt-guide-error");
+const promptGuideCancelButton=document.getElementById("prompt-guide-cancel");
+const promptGuideRestoreButton=document.getElementById("prompt-guide-restore");
+const promptGuideCloseButton=document.getElementById("prompt-guide-close");
 const menuButton=document.getElementById("menu-button");
 const sidebarCloseButton=document.getElementById("sidebar-close");
 const sidebarBackdrop=document.getElementById("sidebar-backdrop");
@@ -45,6 +54,65 @@ const loginForm=document.getElementById("login-form");
 const loginPassword=document.getElementById("login-password");
 const loginError=document.getElementById("login-error");
 const logoutButton=document.getElementById("logout");
+const themeToggleButton=document.getElementById("theme-toggle");
+const metaThemeColor=document.getElementById("meta-theme-color");
+const scrollToLatestButton=document.getElementById("scroll-to-latest");
+
+/* --------------------------------------------------------------------------
+   外观主题：浅 / 深 / 自动三态，只记在浏览器本地。
+   index.html 里已有一段预绘制脚本先写好 data-theme，这里只负责切换与同步。
+   -------------------------------------------------------------------------- */
+const THEME_KEY="chat-theme";
+const THEME_LIGHT_COLOR="#faf9f5";
+const THEME_DARK_COLOR="#131314";
+let themeMode=localStorage.getItem(THEME_KEY)||"auto";
+const darkMedia=window.matchMedia?window.matchMedia("(prefers-color-scheme: dark)"):null;
+
+function themeIsDark(){
+  if(themeMode==="dark")return true;
+  if(themeMode==="light")return false;
+  return Boolean(darkMedia&&darkMedia.matches);
+}
+
+function themeLabel(){
+  if(themeMode==="auto")return `背景颜色：跟随系统（当前${themeIsDark()?"深色":"浅色"}），点击固定为${themeIsDark()?"浅色":"深色"}`;
+  const dark=themeMode==="dark";
+  return `背景颜色：已固定${dark?"深色":"浅色"}，点击切换为${dark?"自动（跟随系统）":"深色"}`;
+}
+
+function applyTheme(animate){
+  const dark=themeIsDark();
+  const root=document.documentElement;
+  if(animate){
+    body.classList.add("theme-anim");
+    setTimeout(()=>body.classList.remove("theme-anim"),260);
+  }
+  root.setAttribute("data-theme",dark?"dark":"light");
+  root.setAttribute("data-theme-mode",themeMode);
+  if(metaThemeColor)metaThemeColor.setAttribute("content",dark?THEME_DARK_COLOR:THEME_LIGHT_COLOR);
+  if(themeToggleButton){
+    const label=themeLabel();
+    themeToggleButton.setAttribute("aria-label",label);
+    themeToggleButton.title=label;
+  }
+}
+
+function setThemeMode(mode){
+  themeMode=mode;
+  localStorage.setItem(THEME_KEY,mode);
+  applyTheme(true);
+}
+
+if(themeToggleButton)themeToggleButton.addEventListener("click",()=>{
+  const order=["auto","light","dark"];
+  setThemeMode(order[(order.indexOf(themeMode)+1)%order.length]);
+});
+if(darkMedia){
+  const onSystemTheme=()=>{if(themeMode==="auto")applyTheme(false)};
+  if(darkMedia.addEventListener)darkMedia.addEventListener("change",onSystemTheme);
+  else if(darkMedia.addListener)darkMedia.addListener(onSystemTheme);
+}
+applyTheme(false);
 
 async function apiFetch(url,options){
   let response;
@@ -60,7 +128,21 @@ async function apiFetch(url,options){
 
 function showLogin(){loginScreen.hidden=false;loginPassword.focus()}
 function hideLogin(){loginScreen.hidden=true}
-function scrollToBottom(){chatScroll.scrollTop=chatScroll.scrollHeight}
+
+/* 只有用户本来贴着底部时才自动跟随；往上翻看历史时不打断，改为浮出“跳到最新”。 */
+const STICK_MARGIN=90;
+let pinnedToBottom=true;
+function distanceFromBottom(){return chatScroll.scrollHeight-chatScroll.scrollTop-chatScroll.clientHeight}
+function updateStickButton(){scrollToLatestButton.hidden=!(messages.length>0&&!pinnedToBottom&&distanceFromBottom()>STICK_MARGIN)}
+function scrollToBottom(force=false){
+  if(!force&&!pinnedToBottom)return;
+  chatScroll.scrollTop=chatScroll.scrollHeight;
+  pinnedToBottom=true;
+  updateStickButton();
+}
+chatScroll.addEventListener("scroll",()=>{pinnedToBottom=distanceFromBottom()<=STICK_MARGIN;updateStickButton()},{passive:true});
+scrollToLatestButton.addEventListener("click",()=>{pinnedToBottom=true;chatScroll.scrollTop=chatScroll.scrollHeight;updateStickButton()});
+
 function updateEmptyState(){emptyState.classList.toggle("hidden",messages.length>0)}
 function setStatus(text="",kind=""){chatStatus.textContent=text;chatStatus.className=`chat-status${kind?` ${kind}`:""}`}
 
@@ -244,7 +326,9 @@ function appendMessage(role,text,options={}){
   article.appendChild(bodyElement);
   messagesEl.appendChild(article);
   updateEmptyState();
+  if(options.scroll!==false)pinnedToBottom=true;
   scrollToBottom();
+  updateStickButton();
   return {article,content,bodyElement};
 }
 
@@ -253,17 +337,90 @@ function renderMessages(){
   messagesEl.innerHTML="";
   messages.forEach((item,index)=>appendMessage(item.role,item.content,{retry:item.role==="assistant"?()=>retryAssistant(index):null,searches:item.search||[],sources:item.sources||[],images:item.images||[]}));
   updateEmptyState();
+  pinnedToBottom=true;
+  scrollToBottom(true);
+  updateStickButton();
+}
+
+/* 流式输出时每个 SSE 分片都要重排整段 Markdown，长回复越到后面越卡。
+   合并到每帧最多一次，收尾时立即补上最后一次完整结果。 */
+function makeThrottledRender(target){
+  let frame=0;
+  let latest="";
+  let stopped=false;
+  const flush=()=>{
+    frame=0;
+    if(stopped)return;
+    renderMarkdown(target,latest);
+    scrollToBottom();
+    updateStickButton();
+  };
+  return {
+    set(text){
+      if(stopped)return;
+      latest=text;
+      if(!frame)frame=requestAnimationFrame(flush);
+    },
+    // 出错时冻结渲染，收尾不会再重排，避免把错误提示覆盖掉
+    cancel(){
+      stopped=true;
+      if(frame){cancelAnimationFrame(frame);frame=0}
+    },
+    finish(){
+      if(stopped)return;
+      stopped=true;
+      if(frame){cancelAnimationFrame(frame);frame=0}
+      if(target.isConnected)renderMarkdown(target,latest);
+    }
+  };
+}
+
+const HISTORY_GROUPS=[
+  {label:"今天",within:86400},
+  {label:"昨天",within:172800},
+  {label:"近 7 天",within:604800},
+  {label:"近 30 天",within:2592000},
+  {label:"更早",within:Infinity}
+];
+
+function historyGroup(updatedAt){
+  const age=(Date.now()/1000)-(updatedAt||0);
+  return HISTORY_GROUPS.find((group)=>age<group.within).label;
+}
+
+function historyTime(item,now){
+  const date=new Date((item.updated_at||0)*1000);
+  const sameDay=date.toDateString()===(now||new Date()).toDateString();
+  return sameDay
+    ?date.toLocaleTimeString("zh-CN",{hour:"2-digit",minute:"2-digit"})
+    :date.toLocaleDateString("zh-CN",{month:"numeric",day:"numeric"});
 }
 
 function renderConversations(){
   conversationList.innerHTML="";
   if(!conversations.length){const empty=document.createElement("div");empty.className="history-empty";empty.textContent="还没有历史对话";conversationList.appendChild(empty);return}
+  const now=new Date();
+  let group="";
   for(const item of conversations){
+    const label=historyGroup(item.updated_at);
+    if(label!==group){
+      group=label;
+      const heading=document.createElement("p");
+      heading.className="history-group-label";
+      heading.textContent=label;
+      conversationList.appendChild(heading);
+    }
     const button=document.createElement("button");
     button.className=`conversation-item${item.id===conversationId?" active":""}`;
     button.type="button";
-    button.textContent=item.title||"新对话";
-    button.title=item.title||"新对话";
+    const title=document.createElement("span");
+    title.className="conversation-title";
+    title.textContent=item.title||"新对话";
+    const time=document.createElement("span");
+    time.className="conversation-time";
+    time.textContent=historyTime(item,now);
+    button.append(title,time);
+    button.title=`${item.title||"新对话"} · ${item.message_count||0} 条消息`;
     button.addEventListener("click",()=>loadConversation(item.id));
     conversationList.appendChild(button);
   }
@@ -344,7 +501,8 @@ async function requestCompletion(){
   setGenerating(true);
   setStatus("AI 正在生成回复…","busy");
   activeController=new AbortController();
-  const assistant=appendMessage("assistant","",{loading:true});
+  const assistant=appendMessage("assistant","",{loading:true,scroll:false});
+  const streamRender=makeThrottledRender(assistant.content);
   let reply="";
   let failed=false;
   let streamNotice="";
@@ -374,23 +532,26 @@ async function requestCompletion(){
         for(const source of payload.sources||[]){if(source&&source.url&&sources.every((item)=>item.url!==source.url))sources.push(source)}
         if(payload.search||payload.sources)renderSearchTrace(assistant.bodyElement,searches,sources);
         reply+=payload.content||"";
-        renderMarkdown(assistant.content,reply);
-        scrollToBottom();
+        streamRender.set(reply);
       }
     }
+    streamRender.finish();
     if(reply)messages.push(assistantRecord(reply,searches,sources));
     setStatus(streamNotice, streamNotice?"error":"");
   }catch(error){
     if(error.name==="AbortError"){
+      streamRender.finish();
       if(reply)messages.push(assistantRecord(reply,searches,sources));
       else assistant.article.remove();
     }else{
       failed=true;
+      streamRender.cancel();
       assistant.article.classList.add("error");
       assistant.content.textContent=`发送失败：${error.message}`;
       setStatus("发送失败，可以点击“重试”。","error");
     }
   }finally{
+    streamRender.finish();
     assistant.article.classList.remove("loading");
     if(assistant.article.isConnected){
       const actions=document.createElement("div");
@@ -707,6 +868,72 @@ configDialog.addEventListener("close",()=>{apiKeyInput.value="";apiKeyInput.type
 apiKeyRevealButton.addEventListener("click",toggleApiKeyVisibility);
 modelsInput.addEventListener("input",refreshModelHint);
 commonModelSelect.addEventListener("change",refreshModelHint);
+
+/* --------------------------------------------------------------------------
+   prompt建议：服务端存的那份“写提示词的方法”，打开时拉取，编辑后写回。
+   默认稿只存在服务端，前端不复制一份，“恢复默认”用接口返回的 default。
+   -------------------------------------------------------------------------- */
+let promptGuideDefault="";
+let promptGuideMaxChars=0;
+
+function updatePromptGuideMeta(){
+  const count=promptGuideText.value.length;
+  const parts=[];
+  if(promptGuideMaxChars)parts.push(`${count} / ${promptGuideMaxChars} 字`);
+  if(promptGuideDefault&&promptGuideText.value!==promptGuideDefault)parts.push("与默认稿不同，保存后生效");
+  promptGuideMeta.textContent=parts.join(" · ");
+}
+
+async function openPromptGuideDialog(){
+  promptGuideError.textContent="";
+  promptGuideText.value="";
+  promptGuideText.disabled=true;
+  updatePromptGuideMeta();
+  promptGuideDialog.showModal();
+  try{
+    const response=await apiFetch("/api/prompt-guide");
+    const data=await response.json().catch(()=>({}));
+    if(!response.ok)throw new Error(data.error||"无法读取提示词建议");
+    promptGuideDefault=data.default||"";
+    promptGuideMaxChars=data.max_chars||0;
+    promptGuideText.value=typeof data.text==="string"?data.text:promptGuideDefault;
+    if(promptGuideMaxChars)promptGuideText.maxLength=promptGuideMaxChars;
+  }catch(error){
+    promptGuideError.textContent=error.message;
+  }finally{
+    promptGuideText.disabled=false;
+    updatePromptGuideMeta();
+  }
+}
+
+async function savePromptGuide(){
+  promptGuideError.textContent="";
+  const submitButton=promptGuideForm.querySelector("button[type='submit']");
+  submitButton.disabled=true;submitButton.textContent="正在保存...";
+  try{
+    const response=await apiFetch("/api/prompt-guide",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text:promptGuideText.value})});
+    const data=await response.json().catch(()=>({}));
+    if(!response.ok)throw new Error(data.error||"提示词建议保存失败");
+    promptGuideDialog.close();
+  }catch(error){
+    promptGuideError.textContent=error.message;
+  }finally{
+    submitButton.disabled=false;submitButton.textContent="保存";
+  }
+}
+
+promptGuideButton.addEventListener("click",openPromptGuideDialog);
+promptGuideCancelButton.addEventListener("click",()=>promptGuideDialog.close());
+promptGuideCloseButton.addEventListener("click",()=>promptGuideDialog.close());
+promptGuideDialog.addEventListener("click",(event)=>{if(event.target===promptGuideDialog)promptGuideDialog.close()});
+promptGuideText.addEventListener("input",updatePromptGuideMeta);
+promptGuideForm.addEventListener("submit",(event)=>{event.preventDefault();savePromptGuide()});
+promptGuideRestoreButton.addEventListener("click",()=>{
+  promptGuideText.value=promptGuideDefault;
+  promptGuideError.textContent="";
+  updatePromptGuideMeta();
+  promptGuideText.focus();
+});
 attachButton.addEventListener("click",()=>imageInput.click());
 imageInput.addEventListener("change",()=>attachImageFile(imageInput.files&&imageInput.files[0]));
 input.addEventListener("paste",(event)=>{

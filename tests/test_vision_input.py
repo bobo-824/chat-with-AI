@@ -309,7 +309,7 @@ class VisionInputTest(unittest.TestCase):
         server.Handler.chat_server.web_search_enabled = True
         status, stream = self.chat([{"role": "user", "content": "picture", "images": [TINY_PNG]}])
         self.assertEqual(status, 200, stream)
-        self.assertIn(server.NATIVE_SEARCH_IMAGE_UNAVAILABLE_NOTICE, stream)
+        self.assertIn("中转站的原生通道没有接受这次带图搜索", stream)
         self.assertIn("noted", stream)
         bodies = self.relay_bodies()
         self.assertEqual(len(bodies), 1)

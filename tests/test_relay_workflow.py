@@ -739,9 +739,49 @@ class WebSearchRelayTest(RelayTestHarness):
         MockRelayHandler.native_search_reply = False
         events = self.chat()
         notices = [event["notice"] for event in events if "notice" in event]
-        self.assertEqual(notices, [server.NATIVE_SEARCH_UNAVAILABLE_NOTICE])
+        self.assertEqual(len(notices), 1)
+        self.assertTrue(notices[0].startswith("原生搜索通道本轮没有成功"), notices)
+        self.assertIn("HTTP 404", notices[0])
         self.assertEqual("".join(event.get("content", "") for event in events), "Hello from relay")
         self.assertNotIn("tools", self.relay_chat_bodies()[0])
+
+    def test_base_url_without_v1_is_completed_on_save(self):
+        """粘贴网关首页（少写 /v1）时保存的必须是补全后的地址，且对话照常出字。"""
+        with self.request(
+            "/api/config",
+            "POST",
+            {
+                "api_key": "relay-secret",
+                "base_url": f"http://127.0.0.1:{self.relay.server_address[1]}",
+                "models": ["relay-model"],
+                "default_model": "relay-model",
+            },
+        ) as response:
+            self.assertEqual(response.status, 200)
+        stored = server.Handler.chat_server.base_url
+        self.assertTrue(stored.endswith("/v1"), stored)
+        with self.request(
+            "/api/chat",
+            "POST",
+            {"messages": [{"role": "user", "content": "hi"}], "model": "relay-model"},
+        ) as response:
+            stream = response.read().decode("utf-8")
+        events = [
+            json.loads(part[5:].strip())
+            for part in stream.split("\n\n")
+            if part.startswith("data:") and "[DONE]" not in part
+        ]
+        self.assertEqual("".join(e.get("content", "") for e in events), "Hello from relay")
+
+    def test_loaded_base_url_without_v1_is_repaired_without_saving(self):
+        settings = server.ChatServer(
+            app_password="",
+            config_path=Path(self.history_path.with_name(f".repair-{uuid4().hex}.json")),
+        )
+        settings.config_store.save({"base_url": "https://relay.example.com", "models": []})
+        restarted = server.ChatServer(app_password="", config_path=settings.config_store.path)
+        self.assertEqual(restarted.base_url, "https://relay.example.com/v1")
+        settings.config_store.path.unlink(missing_ok=True)
 
     def test_switch_rejects_non_boolean_values(self):
         with self.assertRaises(HTTPError) as raised:

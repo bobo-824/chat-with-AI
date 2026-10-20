@@ -29,12 +29,12 @@ MANIFEST_JSON = """{
 "start_url":"/",
 "scope":"/",
 "display":"standalone",
-"background_color":"#0b1120",
-"theme_color":"#111827",
+"background_color":"#faf9f5",
+"theme_color":"#131314",
 "icons":[{"src":"/icon.svg","sizes":"any","type":"image/svg+xml","purpose":"any"}]
 }"""
 
-SERVICE_WORKER_JS = """const CACHE="chat-app-v15";
+SERVICE_WORKER_JS = """const CACHE="chat-app-v18";
 const ASSETS=["/","/style.css","/app.js","/manifest.webmanifest","/icon.svg"];
 self.addEventListener("install",(event)=>{
 event.waitUntil(caches.open(CACHE).then((cache)=>cache.addAll(ASSETS)));
@@ -111,6 +111,7 @@ RATE_LIMIT_WINDOWS = {
     "chat": (30, 60.0),
     "config_write": (20, 60.0),
     "dictionary": (60, 60.0),
+    "prompt_guide": (30, 60.0),
 }
 RATE_LIMIT_TRACKED_KEYS = 512
 
@@ -202,6 +203,43 @@ def validate_relay_base_url(base_url):
     if port is not None and not 1 <= port <= 65535:
         raise ValueError("API URL 端口无效")
     return candidate
+
+
+# 中转站把 OpenAI 兼容端点挂在 /v1 下面。用户粘贴的常常是网关首页地址
+# （https://relay.example.com），少了结尾的 /v1；此时 SDK 会请求 /chat/completions，
+# 网关的前端路由把这个路径也返回 200 + HTML（New API 一类网关的兜底页），于是
+# SSE 解析一行 data: 都拿不到，回复静默变空。补全 /v1 让两种写法都能正常工作。
+RELAY_API_SUFFIXES = (
+    "/chat/completions",
+    "/completions",
+    "/messages",
+    "/responses",
+    "/embeddings",
+    "/models",
+)
+
+
+def normalize_relay_base_url(base_url):
+    """Return the OpenAI-compatible base URL with a trailing /v1, fixing common paste errors."""
+    if not isinstance(base_url, str) or not base_url.strip():
+        return base_url if base_url is None else (base_url or None)
+    trimmed = base_url.strip().rstrip("/")
+    if not trimmed:
+        return None
+    lowered = trimmed.lower()
+    # 有人直接粘贴完整端点：先剥掉尾部 API 路径，再剥掉可能残留的 /v1，回到站点根。
+    for suffix in RELAY_API_SUFFIXES:
+        for candidate in (f"/v1{suffix}", suffix):
+            if lowered.endswith(candidate):
+                trimmed = trimmed[: -len(candidate)].rstrip("/")
+                lowered = trimmed.lower()
+                break
+        else:
+            continue
+        break
+    if lowered.endswith("/v1"):
+        return trimmed
+    return f"{trimmed}/v1"
 
 
 def allowed_extra_hosts():
@@ -572,13 +610,16 @@ VISION_INPUT_TOO_LARGE_ERROR = "图片太大，请在浏览器里压缩后再发
 VISION_INPUT_COUNT_ERROR = "一条消息最多附带 1 张图片"
 VISION_INPUT_ROLE_ERROR = "只有你发送的消息可以附带图片"
 VISION_INPUT_EMPTY_ERROR = "图片数据无法解码，请重新选择图片"
-NATIVE_SEARCH_IMAGE_UNAVAILABLE_NOTICE = "中转站的原生通道没有接受这次带图搜索，本轮已按普通对话回答（图片仍然有效）"
-NATIVE_SEARCH_UNAVAILABLE_NOTICE = "中转站未提供原生 Anthropic 搜索端点，本轮已按普通对话回答"
+NATIVE_SEARCH_IMAGE_UNAVAILABLE_NOTICE = "中转站的原生通道没有接受这次带图搜索（{reason}），本轮已按普通对话回答（图片仍然有效）"
+NATIVE_SEARCH_UNAVAILABLE_NOTICE = "原生搜索通道本轮没有成功（{reason}），已按普通对话回答"
 NATIVE_SEARCH_UNSUPPORTED_MODEL_NOTICE = "联网搜索仅在 Claude 模型下可用，本轮已按普通对话回答"
+RELAY_EMPTY_REPLY_ERROR = "中转站没有返回任何内容，请确认 API URL（结尾应为 /v1）和模型名与中转站提供的一致"
 
 
 class NativeSearchUnavailable(RuntimeError):
-    """The gateway has no usable native Anthropic Messages endpoint for this request."""
+    """The native Anthropic Messages channel could not answer this request."""
+
+
 RELAY_SOURCE_LIMIT = 12
 RELAY_TEXT_LIMIT = 240
 RELAY_QUERY_PATTERN = re.compile(r"\x22(?:query|q|question)\x22\s*:\s*\x22([^\x22]+)")
@@ -935,6 +976,53 @@ def translate_anthropic_stream(events, api_key=""):
                 yield from emit_results(block["block"])
 
 
+PROMPT_GUIDE_MAX_CHARS = 20000
+
+# “prompt建议”面板的默认稿。前端不复制这份文本，一律通过 GET /api/prompt-guide 的
+# default 字段取用，所以这里是唯一来源；“恢复默认”按钮也用它。
+PROMPT_GUIDE_DEFAULT_TEXT = """# 怎样写好提示词
+
+## 一、先想清楚，再动手
+- 用一句话说清你要的结果长什么样。
+- 决定格式：段落、列表、表格，还是代码。
+- 想好怎么判断好坏——你就是那个验收的人。
+
+## 二、一条好提示词的六个零件
+1. 角色：让它以什么身份来答（“你是一位审稿编辑”）。
+2. 任务：一句话说清要它做什么。
+3. 上下文：背景、约束、已知信息，别让它猜。
+4. 输出格式：结构、长度、语气，越具体越好。
+5. 示例：给一两组「输入 → 期望输出」，比讲十句道理管用。
+6. 边界：不该做什么，以及没有把握时怎么办（直说，不要编）。
+
+不是每条都要写满六个零件。小事写「任务 + 格式」就够；越是重要的输出，越值得把零件铺全。
+
+## 三、把大任务拆开
+- 先让它复述一遍你的要求，确认没跑偏，再让它动笔。
+- 复杂的事分步走：“先给大纲，我确认后再逐节展开”。
+- 让它说明思路，出错时你能定位到底哪一步歪了。
+
+## 四、迭代，别指望一次到位
+- 不满意就具体指出哪里不对：太长、太笼统、格式错了、语气不对。
+- 每一轮里被迫补充的说明，回头补进提示词，下次直接带上——好的提示词是攒出来的。
+
+## 五、常见的四个毛病
+- 只给一个动词（“分析一下”），却没说要什么结论。
+- 一条消息里塞好几个互不相干的目标。
+- 示例的格式和正式要求的格式不一致。
+- 默认它知道你脑子里的上下文。
+
+## 六、一个可以直接套用的模板
+```
+你是〔角色〕。
+请帮我〔任务〕。
+背景：〔上下文与约束〕
+输出要求：〔格式、长度、语气〕
+参考示例：〔输入 → 期望输出〕
+注意：〔不要做什么；不确定时怎么办〕
+```
+"""
+
 DICTIONARY_JSON_PATH = Path(__file__).with_name("data") / "dict-en-zh.json"
 DICTIONARY_WORD_PATTERN = re.compile(r"^[A-Za-z][A-Za-z'\u2019-]{0,23}$")
 DICTIONARY_INDEX_WORD_PATTERN = re.compile(r"^[a-z][a-z']{0,23}$")
@@ -1135,6 +1223,36 @@ class AppConfigStore:
             write_private_text(self.path, payload)
 
 
+class PromptGuideStore:
+    """“prompt建议”面板里那份可编辑的提示词方法，落在服务端，重启后仍在。"""
+
+    def __init__(self, path=None):
+        self.path = Path(path) if path else Path(__file__).with_name("prompt-guide.json")
+        self.lock = threading.Lock()
+
+    def load(self):
+        try:
+            with self.path.open("r", encoding="utf-8") as file:
+                data = json.load(file)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return PROMPT_GUIDE_DEFAULT_TEXT
+        if not isinstance(data, dict):
+            return PROMPT_GUIDE_DEFAULT_TEXT
+        text = data.get("text")
+        if not isinstance(text, str):
+            return PROMPT_GUIDE_DEFAULT_TEXT
+        return text
+
+    def save(self, text):
+        if not isinstance(text, str):
+            raise ValueError("提示词内容格式错误")
+        if len(text) > PROMPT_GUIDE_MAX_CHARS:
+            raise ValueError(f"提示词内容过长，最多 {PROMPT_GUIDE_MAX_CHARS} 字")
+        payload = json.dumps({"version": 1, "text": text}, ensure_ascii=False, indent=2)
+        with self.lock:
+            write_private_text(self.path, payload)
+
+
 class SecretStore:
     def __init__(self, path=None):
         self.path = Path(path) if path else Path(__file__).with_name("app-secret.json")
@@ -1204,6 +1322,9 @@ class ChatServer:
         self.conversations = ConversationStore()
         self.dictionary = DictionaryStore()
         self.config_store = AppConfigStore(config_path)
+        self.prompt_guide = PromptGuideStore(
+            None if config_path is None else self.config_store.path.with_name(f"{self.config_store.path.stem}.prompt-guide.json")
+        )
         secret_path = self.config_store.path.with_name(
             "app-secret.json" if config_path is None else f"{self.config_store.path.stem}.secret.json"
         )
@@ -1222,7 +1343,9 @@ class ChatServer:
             saved_config.pop("api_key", None)
             self.config_store.save(saved_config)
         self.api_key = os.environ.get("OPENAI_API_KEY") or stored_api_key
-        self.base_url = os.environ.get("OPENAI_BASE_URL") or saved_config.get("base_url")
+        self.base_url = normalize_relay_base_url(
+            os.environ.get("OPENAI_BASE_URL") or saved_config.get("base_url")
+        )
         configured_models = os.environ.get("OPENAI_MODELS")
         self.configured_models = normalize_models(
             configured_models.split(",") if configured_models else saved_config.get("models", [])
@@ -1322,7 +1445,7 @@ class ChatServer:
         search_input=None,
     ):
         api_key = normalize_api_key(api_key)
-        base_url = validate_relay_base_url(base_url)
+        base_url = normalize_relay_base_url(validate_relay_base_url(base_url))
         with self.config_lock:
             self.api_key = api_key
             self.base_url = base_url
@@ -1451,26 +1574,38 @@ class ChatServer:
         if web_search:
             if self.search_allowed_for(model):
                 started = False
+                produced = False
+                failure = None
                 try:
                     native_messages = (
                         anthropic_relay_payload(messages) if has_images else payload_messages
                     )
                     for event in self.stream_anthropic_search(native_messages, model):
                         started = True
+                        produced = True
                         yield event
-                    return
                 except Exception as error:
+                    failure = error
                     if started:
                         raise
-                    if relay_debug_enabled():
-                        self.log_relay_debug(
-                            "native_search_unavailable", {"reason": self.safe_error_message(error)}
-                        )
-                    yield {
-                        "notice": NATIVE_SEARCH_IMAGE_UNAVAILABLE_NOTICE
-                        if has_images
-                        else NATIVE_SEARCH_UNAVAILABLE_NOTICE
-                    }
+                if produced:
+                    return
+                # 原生通道本轮没能给出任何内容：可能是端点不存在、模型不支持搜索工具，
+                # 也可能是网关回了 200 却一帧事件都没有。两种情况都退回普通对话，
+                # 并把真实原因写进提示，不再一律说成"未提供原生端点"。
+                reason = (
+                    _relay_clip(self.safe_error_message(failure), 160)
+                    if failure is not None
+                    else "连接成功但没有返回任何搜索事件"
+                ) or "原因未知"
+                if relay_debug_enabled():
+                    self.log_relay_debug("native_search_unavailable", {"reason": reason})
+                template = (
+                    NATIVE_SEARCH_IMAGE_UNAVAILABLE_NOTICE
+                    if has_images
+                    else NATIVE_SEARCH_UNAVAILABLE_NOTICE
+                )
+                yield {"notice": template.format(reason=reason)}
             else:
                 yield {"notice": NATIVE_SEARCH_UNSUPPORTED_MODEL_NOTICE}
 
@@ -1516,6 +1651,7 @@ class ChatServer:
     def stream_relay_chunks(self, response, debug=True):
         identity = {}
         collector = RelaySearchCollector(self.api_key)
+        produced = False
         for index, chunk in enumerate(response):
             payload = redact_relay_debug(chunk.model_dump(mode="json", exclude_unset=True), self.api_key)
             if debug:
@@ -1529,13 +1665,20 @@ class ChatServer:
                 delta = choice.get("delta")
                 content = delta.get("content") if isinstance(delta, dict) else None
                 if isinstance(content, str) and content:
+                    produced = True
                     yield {"content": content}
             for event in collector.events(payload):
+                produced = True
                 yield event
         for event in collector.flush():
+            produced = True
             yield event
         if debug:
             self.log_relay_debug("identity_summary", identity)
+        if not produced:
+            # 网关返回了 200 却没有一帧可解析内容——典型原因是 API URL 少了 /v1，
+            # 命中网关前端页面的 HTML 兜底路由。与其静默给出空回复，不如明说。
+            raise RuntimeError(RELAY_EMPTY_REPLY_ERROR)
 
     def log_relay_debug(self, event, data):
         print("[relay-response-debug] " + json.dumps({"event": event, **data}, ensure_ascii=False), flush=True)
@@ -1861,6 +2004,17 @@ class Handler(BaseHTTPRequestHandler):
                     )
         elif path == "/api/conversations":
             self.send_json(200, {"conversations": self.chat_server.conversations.list_conversations()})
+        elif path == "/api/prompt-guide":
+            text = self.chat_server.prompt_guide.load()
+            self.send_json(
+                200,
+                {
+                    "text": text,
+                    "default": PROMPT_GUIDE_DEFAULT_TEXT,
+                    "customized": text != PROMPT_GUIDE_DEFAULT_TEXT,
+                    "max_chars": PROMPT_GUIDE_MAX_CHARS,
+                },
+            )
         elif path == "/api/models":
             if not self.chat_server.is_configured():
                 self.send_json(409, {"error": "请先在左侧栏“连接设置”里配置 API URL 和 Key"})
@@ -1935,6 +2089,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/chat" and not self.require_rate_limit("chat"):
             return
         if path == "/api/dictionary" and not self.require_rate_limit("dictionary"):
+            return
+        if path == "/api/prompt-guide" and not self.require_rate_limit("prompt_guide"):
             return
         if path == "/api/config":
             body = self.read_json_body()
@@ -2020,6 +2176,25 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "请输入一个英文单词"})
                 return
             self.send_json(200, self.chat_server.dictionary.lookup(word))
+            return
+        if path == "/api/prompt-guide":
+            body = self.read_json_body()
+            if not isinstance(body, dict):
+                self.send_json(400, {"error": "Invalid JSON body"})
+                return
+            text = body.get("text")
+            if not isinstance(text, str):
+                self.send_json(400, {"error": "提示词内容格式错误"})
+                return
+            try:
+                self.chat_server.prompt_guide.save(text)
+            except ValueError as error:
+                self.send_json(400, {"error": str(error)})
+                return
+            except OSError as error:
+                self.send_json(500, {"error": self.chat_server.safe_error_message(error)})
+                return
+            self.send_json(200, {"ok": True, "saved": True, "customized": text != PROMPT_GUIDE_DEFAULT_TEXT})
             return
         if path != "/api/chat":
             self.send_json(404, {"error": "Not found"})
