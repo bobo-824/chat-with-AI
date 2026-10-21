@@ -34,7 +34,7 @@ MANIFEST_JSON = """{
 "icons":[{"src":"/icon.svg","sizes":"any","type":"image/svg+xml","purpose":"any"}]
 }"""
 
-SERVICE_WORKER_JS = """const CACHE="chat-app-v18";
+SERVICE_WORKER_JS = """const CACHE="chat-app-v19";
 const ASSETS=["/","/style.css","/app.js","/manifest.webmanifest","/icon.svg"];
 self.addEventListener("install",(event)=>{
 event.waitUntil(caches.open(CACHE).then((cache)=>cache.addAll(ASSETS)));
@@ -583,6 +583,15 @@ WEB_SEARCH_RESULT_BLOCK = "web_search_tool_result"
 ANTHROPIC_VERSION = "2023-06-01"
 ANTHROPIC_MAX_TOKENS = 4096
 NATIVE_SEARCH_MODEL_MARKER = "claude"
+# Only a version digit identifies an OpenAI model: relay aliases such as "gpt-pro-稳定 2x"
+# really name Claude, so a bare "gpt" substring must not claim them for the Responses API.
+OPENAI_SEARCH_MODEL_PATTERN = re.compile(r"(?:gpt|chatgpt)-[3-9]|\bo[134](?:-|\b)")
+OPENAI_SEARCH_TOOL_TYPE = "web_search"
+OPENAI_SEARCH_TOOL_LEGACY_TYPE = "web_search_2025_08_26"
+OPENAI_SEARCH_CONTEXT_SIZE = "medium"
+SEARCH_TRANSPORT_ANTHROPIC = "anthropic"
+SEARCH_TRANSPORT_OPENAI = "openai"
+SEARCH_TRANSPORTS = (SEARCH_TRANSPORT_ANTHROPIC, SEARCH_TRANSPORT_OPENAI)
 CHAT_MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024
 IMAGE_DATA_URI_PATTERN = re.compile(r"^data:image/(png|jpeg|webp);base64,([A-Za-z0-9+/=]+)$")
 VISION_MODEL_MARKERS = (
@@ -612,7 +621,7 @@ VISION_INPUT_ROLE_ERROR = "只有你发送的消息可以附带图片"
 VISION_INPUT_EMPTY_ERROR = "图片数据无法解码，请重新选择图片"
 NATIVE_SEARCH_IMAGE_UNAVAILABLE_NOTICE = "中转站的原生通道没有接受这次带图搜索（{reason}），本轮已按普通对话回答（图片仍然有效）"
 NATIVE_SEARCH_UNAVAILABLE_NOTICE = "原生搜索通道本轮没有成功（{reason}），已按普通对话回答"
-NATIVE_SEARCH_UNSUPPORTED_MODEL_NOTICE = "联网搜索仅在 Claude 模型下可用，本轮已按普通对话回答"
+NATIVE_SEARCH_UNSUPPORTED_MODEL_NOTICE = "联网搜索只在 Claude 或 GPT 这类支持原生搜索工具的模型下可用，本轮已按普通对话回答；模型名认不出来时，可在“连接设置”的“联网搜索通道”里手动指定"
 RELAY_EMPTY_REPLY_ERROR = "中转站没有返回任何内容，请确认 API URL（结尾应为 /v1）和模型名与中转站提供的一致"
 
 
@@ -676,6 +685,72 @@ def anthropic_relay_payload(messages):
 def web_search_tool_declaration():
     """Anthropic server tool declaration sent on the native Messages endpoint."""
     return {"type": WEB_SEARCH_TOOL_TYPE, "name": WEB_SEARCH_TOOL_NAME, "max_uses": WEB_SEARCH_MAX_USES}
+
+
+def responses_endpoint(base_url):
+    """Derive the gateway native OpenAI Responses URL from an OpenAI-compatible base URL."""
+    trimmed = (base_url or "").strip().rstrip("/")
+    if trimmed.endswith("/v1/responses"):
+        return trimmed
+    if trimmed.endswith("/v1"):
+        trimmed = trimmed[: -len("/v1")].rstrip("/")
+    if not trimmed:
+        raise ValueError("API URL 缺少有效的服务地址")
+    return f"{trimmed}/v1/responses"
+
+
+def web_search_tool_declaration_openai(legacy=False):
+    """OpenAI built-in web_search tool declaration sent on the native Responses endpoint.
+
+    The Responses API has no max-uses cap, so the GPT channel cannot promise the
+    "at most 3 searches" the Claude channel can.
+    """
+    tool = {"type": OPENAI_SEARCH_TOOL_LEGACY_TYPE if legacy else OPENAI_SEARCH_TOOL_TYPE}
+    tool["search_context_size"] = OPENAI_SEARCH_CONTEXT_SIZE
+    return tool
+
+
+def responses_image_item(image):
+    """Turn a validated inline data URI into a native Responses input_image item."""
+    header, _, payload = image.partition(",")
+    media_type = header.split(":", 1)[1].split(";", 1)[0].strip().lower() if ":" in header else ""
+    if media_type not in ANTHROPIC_IMAGE_MEDIA_TYPES or not payload:
+        raise ValueError(VISION_INPUT_TYPE_ERROR)
+    return {"type": "input_image", "image_url": image, "detail": "auto"}
+
+
+def responses_relay_payload(messages):
+    """Project stored history onto the native Responses input array.
+
+    Roles in saved history are only ever user/assistant, and EasyInputMessage accepts
+    both, so plain text stays a string and only image-bearing turns become part lists.
+    """
+    projected = []
+    for item in messages:
+        if not isinstance(item, dict) or "role" not in item or "content" not in item:
+            projected.append(item)
+            continue
+        images = item.get("images")
+        if not images:
+            projected.append({"role": item["role"], "content": item["content"]})
+            continue
+        parts = []
+        if item["content"]:
+            parts.append({"type": "input_text", "text": item["content"]})
+        parts.extend(responses_image_item(image) for image in images)
+        projected.append({"role": item["role"], "content": parts})
+    return projected
+
+
+def responses_search_payload(messages, model, legacy_tool=False):
+    """Build the native request body that carries the OpenAI web_search tool."""
+    return {
+        "model": model,
+        "stream": True,
+        "store": False,
+        "tools": [web_search_tool_declaration_openai(legacy=legacy_tool)],
+        "input": messages,
+    }
 
 
 def _relay_text(value):
@@ -802,9 +877,14 @@ def native_client():
         return _native_client
 
 
-def model_supports_native_search(model):
-    """Anthropic ships web_search only as a Claude server tool."""
-    return NATIVE_SEARCH_MODEL_MARKER in (model or "").lower()
+def search_transport_for(model):
+    """Pick which vendor's native search channel a model name should use."""
+    name = (model or "").lower()
+    if NATIVE_SEARCH_MODEL_MARKER in name:
+        return SEARCH_TRANSPORT_ANTHROPIC
+    if OPENAI_SEARCH_MODEL_PATTERN.search(name):
+        return SEARCH_TRANSPORT_OPENAI
+    return None
 
 
 def model_supports_vision(model):
@@ -974,6 +1054,95 @@ def translate_anthropic_stream(events, api_key=""):
                     yield {"search": {"query": redact_relay_debug(query, api_key)}}
             elif block.get("type") == WEB_SEARCH_RESULT_BLOCK:
                 yield from emit_results(block["block"])
+
+
+def _responses_search_action(item):
+    """Return the search action of a web_search_call output item, if it has one."""
+    if not isinstance(item, dict):
+        return None
+    if item.get("type") != "web_search_call":
+        return None
+    action = item.get("action")
+    return action if isinstance(action, dict) and action.get("type") == "search" else None
+
+
+def translate_openai_search_stream(events, api_key=""):
+    """Map native OpenAI Responses stream events onto the app content/search/sources payloads.
+
+    The Claude channel reads search metadata out of Anthropic content blocks; the
+    Responses API puts the same facts on a web_search_call item plus url_citation
+    annotations on the text. Either way the app sees content / search / sources events.
+    """
+    queries = []
+    urls = []
+
+    def emit_queries(action):
+        found = []
+        candidates = [action.get("query")] if isinstance(action.get("query"), str) else []
+        candidates += [item for item in (action.get("queries") or []) if isinstance(item, str)]
+        for raw in candidates:
+            query = _relay_clip(raw)
+            if not query or query in queries:
+                continue
+            queries.append(query)
+            found.append({"search": {"query": redact_relay_debug(query, api_key)}})
+        return found
+
+    def emit_sources(nodes):
+        found = []
+        for node in nodes:
+            source = _relay_source(node) if isinstance(node, dict) else None
+            if source is None or source["url"] in urls or len(urls) >= RELAY_SOURCE_LIMIT:
+                continue
+            urls.append(source["url"])
+            found.append({"sources": [redact_relay_debug(source, api_key)]})
+        return found
+
+    for event in events:
+        kind = _relay_text(event.get("type"))
+        if kind == "response.output_text.delta":
+            chunk_text = _relay_text(event.get("delta"))
+            if chunk_text:
+                yield {"content": chunk_text}
+        elif kind == "response.output_text.annotation.added":
+            annotation = event.get("annotation")
+            if isinstance(annotation, dict) and annotation.get("type") == "url_citation":
+                yield from emit_sources([annotation])
+        elif kind in ("response.output_item.added", "response.output_item.done", "response.web_search_call.completed"):
+            item = event.get("item")
+            action = _responses_search_action(item)
+            if action is None:
+                continue
+            yield from emit_queries(action)
+            yield from emit_sources(action.get("sources") or [])
+        elif kind == "response.completed":
+            response = event.get("response")
+            if isinstance(response, dict):
+                yield from _responses_output_sources(response, urls, api_key)
+            return
+        elif kind in ("response.failed", "response.error"):
+            payload = event.get("response") if isinstance(event.get("response"), dict) else event
+            error = payload.get("error") if isinstance(payload.get("error"), dict) else payload
+            reason = _relay_clip(f"{error.get('type') or ''} {error.get('message') or ''}".strip(), 300)
+            raise NativeSearchUnavailable(reason or "上游搜索请求失败")
+
+
+def _responses_output_sources(response, urls, api_key):
+    """Harvest url_citation annotations left on the finished answer text."""
+    found = []
+    for item in response.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        for content in item.get("content") or []:
+            if not isinstance(content, dict):
+                continue
+            for node, _trail in _iter_json_nodes(content.get("annotations")):
+                source = _relay_source(node) if node.get("type") == "url_citation" or "url" in node else None
+                if source is None or source["url"] in urls or len(urls) >= RELAY_SOURCE_LIMIT:
+                    continue
+                urls.append(source["url"])
+                found.append({"sources": [redact_relay_debug(source, api_key)]})
+    return found
 
 
 PROMPT_GUIDE_MAX_CHARS = 20000
@@ -1359,6 +1528,8 @@ class ChatServer:
         self.web_search_enabled = bool(saved_config.get("web_search"))
         self.vision_input = bool(saved_config.get("vision_input"))
         self.search_input = bool(saved_config.get("search_input"))
+        saved_transport = saved_config.get("search_transport")
+        self.search_transport = saved_transport if saved_transport in SEARCH_TRANSPORTS else ""
         self.app_password = app_password if app_password is not None else os.environ.get("APP_PASSWORD")
         self.session_lock = threading.Lock()
         self.sessions = {}
@@ -1443,9 +1614,12 @@ class ChatServer:
         web_search=None,
         vision_input=None,
         search_input=None,
+        search_transport=None,
     ):
         api_key = normalize_api_key(api_key)
         base_url = normalize_relay_base_url(validate_relay_base_url(base_url))
+        if search_transport is not None and search_transport not in (*SEARCH_TRANSPORTS, ""):
+            raise ValueError("搜索通道格式错误")
         with self.config_lock:
             self.api_key = api_key
             self.base_url = base_url
@@ -1461,6 +1635,8 @@ class ChatServer:
                 self.vision_input = bool(vision_input)
             if search_input is not None:
                 self.search_input = bool(search_input)
+            if search_transport is not None:
+                self.search_transport = search_transport
             if persist:
                 if persist_api_key:
                     self.secret_store.save(self.api_key)
@@ -1471,6 +1647,7 @@ class ChatServer:
                     "web_search": self.web_search_enabled,
                     "vision_input": self.vision_input,
                     "search_input": self.search_input,
+                    "search_transport": self.search_transport,
                 })
 
     def select_default_model(self, model, models=None):
@@ -1488,6 +1665,7 @@ class ChatServer:
                 "web_search": self.web_search_enabled,
                 "vision_input": self.vision_input,
                 "search_input": self.search_input,
+                "search_transport": self.search_transport,
             })
 
     def rate_limit_key(self, token, source_ip):
@@ -1522,14 +1700,29 @@ class ChatServer:
                 "vision_input_enabled": bool(self.vision_input),
                 "vision_auto_supported": model_supports_vision(self.default_model),
                 "search_input_enabled": bool(self.search_input),
-                "search_auto_supported": model_supports_native_search(self.default_model),
+                "search_auto_supported": search_transport_for(self.default_model) is not None,
+                "search_transport": self.search_transport,
+                "search_transport_auto": search_transport_for(self.default_model),
+                "search_transport_active": self.resolve_search_transport(self.default_model),
             }
 
     def vision_allowed_for(self, model):
         return self.vision_input or model_supports_vision(model)
 
-    def search_allowed_for(self, model):
-        return self.search_input or model_supports_native_search(model)
+    def resolve_search_transport(self, model):
+        """Which vendor's native search channel this turn should use, if any.
+
+        The model name decides whenever it can, so one relay that serves both Claude and
+        GPT models routes each of them correctly. Only when the name matches nothing do
+        the manual settings apply: the chosen channel, else the legacy "this model
+        supports web search" checkbox, which has always meant the Anthropic Messages one.
+        """
+        transport = search_transport_for(model)
+        if transport:
+            return transport
+        if self.search_transport:
+            return self.search_transport
+        return SEARCH_TRANSPORT_ANTHROPIC if self.search_input else None
 
     def ensure_client(self):
         with self.config_lock:
@@ -1572,15 +1765,23 @@ class ChatServer:
         payload_messages = relay_payload(messages)
         has_images = messages_have_images(messages)
         if web_search:
-            if self.search_allowed_for(model):
+            transport = self.resolve_search_transport(model)
+            if transport:
                 started = False
                 produced = False
                 failure = None
                 try:
-                    native_messages = (
-                        anthropic_relay_payload(messages) if has_images else payload_messages
-                    )
-                    for event in self.stream_anthropic_search(native_messages, model):
+                    if transport == SEARCH_TRANSPORT_OPENAI:
+                        native_messages = (
+                            responses_relay_payload(messages) if has_images else payload_messages
+                        )
+                        events = self.stream_responses_search(native_messages, model)
+                    else:
+                        native_messages = (
+                            anthropic_relay_payload(messages) if has_images else payload_messages
+                        )
+                        events = self.stream_anthropic_search(native_messages, model)
+                    for event in events:
                         started = True
                         produced = True
                         yield event
@@ -1647,6 +1848,40 @@ class ChatServer:
                 detail = _relay_clip(response.read().decode("utf-8", "replace"), 300)
                 raise NativeSearchUnavailable(f"HTTP {response.status_code}: {detail}")
             yield from translate_anthropic_stream(iter_anthropic_events(response.iter_lines()), self.api_key)
+
+    def stream_responses_search(self, messages, model):
+        """Stream a GPT answer that may call the native OpenAI web_search tool.
+
+        The OpenAI channel needs no key mapping: the same OpenAI key the chat already
+        uses is sent as a bearer token, because the gateway serves /v1/responses itself.
+        """
+        endpoint = responses_endpoint(self.base_url)
+        headers = {
+            "authorization": f"Bearer {self.api_key or ''}",
+            "content-type": "application/json",
+            "accept": "text/event-stream",
+        }
+        client = native_client()
+        for legacy in (False, True):
+            body = responses_search_payload(messages, model, legacy_tool=legacy)
+            with client.stream(
+                "POST", endpoint, json=body, headers=headers, timeout=relay_timeout_seconds()
+            ) as response:
+                if response.status_code == 200:
+                    yield from translate_openai_search_stream(
+                        iter_anthropic_events(response.iter_lines()), self.api_key
+                    )
+                    return
+                detail = _relay_clip(response.read().decode("utf-8", "replace"), 300)
+                # Older gateways only accept the dated tool name, so give the legacy
+                # spelling one try before reporting the failure. Nothing else retries.
+                if legacy or not self._rejects_search_tool_type(detail):
+                    raise NativeSearchUnavailable(f"HTTP {response.status_code}: {detail}")
+
+    @staticmethod
+    def _rejects_search_tool_type(detail):
+        lowered = (detail or "").lower()
+        return "tool" in lowered and any(marker in lowered for marker in ("invalid", "unsupported", "unknown", "not supported", "unrecognized"))
 
     def stream_relay_chunks(self, response, debug=True):
         identity = {}
@@ -2128,6 +2363,10 @@ class Handler(BaseHTTPRequestHandler):
             if search_input is not None and not isinstance(search_input, bool):
                 self.send_json(400, {"error": "搜索模型开关格式错误"})
                 return
+            search_transport = body.get("search_transport")
+            if search_transport is not None and search_transport != "" and search_transport not in SEARCH_TRANSPORTS:
+                self.send_json(400, {"error": "搜索通道格式错误"})
+                return
             models = normalize_models(models)
             default_model = (default_model or "").strip() or (models[0] if models else None)
             models = normalize_models([*models, default_model] if default_model else models)
@@ -2141,6 +2380,7 @@ class Handler(BaseHTTPRequestHandler):
                     web_search=web_search,
                     vision_input=vision_input,
                     search_input=search_input,
+                    search_transport=search_transport,
                 )
             except OSError as error:
                 self.send_json(500, {"error": self.chat_server.safe_error_message(error)})

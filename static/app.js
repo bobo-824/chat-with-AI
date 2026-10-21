@@ -29,6 +29,8 @@ const webSearchInput=document.getElementById("web-search");
 const dictionaryToggleInput=document.getElementById("dictionary-enabled");
 const visionInput=document.getElementById("vision-input");
 const searchInput=document.getElementById("search-input");
+const searchTransportSelect=document.getElementById("search-transport");
+const searchTransportHint=document.getElementById("search-transport-hint");
 const modelHint=document.getElementById("model-hint");
 const attachButton=document.getElementById("attach-image");
 const imageInput=document.getElementById("image-input");
@@ -662,10 +664,26 @@ async function refreshVisionCapability(){
     if(!response.ok)return;
     const data=await response.json();
     visionEnabled=Boolean(data.vision_input_enabled||data.vision_auto_supported);
+    refreshSearchTransportHint(data);
   }catch(error){
     return;
   }
   refreshImageControls();
+}
+
+function refreshSearchTransportHint(data={}){
+  if(!searchTransportHint)return;
+  const model=data.default_model||modelSelect.value||"";
+  const labels={anthropic:"Anthropic Messages（/v1/messages）",openai:"OpenAI Responses（/v1/responses）"};
+  if(!data.web_search_enabled){searchTransportHint.textContent="";return}
+  const active=data.search_transport_active;
+  if(active){
+    const manual=data.search_transport&&active===data.search_transport&&!data.search_transport_auto;
+    const reason=manual?"（按你在上面手动指定的通道）":"（按模型名自动判断）";
+    searchTransportHint.textContent=`当前模型「${model||"未选择"}」会走${labels[active]||active}${reason}。`;
+  }else{
+    searchTransportHint.textContent=`当前模型「${model||"未选择"}」的名字里既没有 claude 也没有 gpt，无法自动判断走哪条原生搜索通道，本轮不会联网。可在上方“联网搜索通道”手动指定。`;
+  }
 }
 
 const DICTIONARY_TOKEN=/[A-Za-z][A-Za-z'\u2019-]{1,23}/g;
@@ -839,6 +857,9 @@ async function openConfigDialog(){
   visionInput.dataset.savedState=visionInput.checked?"1":"0";
   searchInput.checked=Boolean(saved.search_input_enabled);
   searchInput.dataset.savedState=searchInput.checked?"1":"0";
+  searchTransportSelect.value=saved.search_transport||"";
+  searchTransportSelect.dataset.savedState=searchTransportSelect.value;
+  refreshSearchTransportHint(saved);
   refreshModelHint();
   configError.textContent="";
   configDialog.showModal();
@@ -846,7 +867,7 @@ async function openConfigDialog(){
 
 async function saveConfig(){
   const baseUrl=baseUrlInput.value.trim().replace(/\/$/,"");const apiKey=apiKeyInput.value.trim();const keyChanged=apiKey!==apiKeyDraft;const commonModel=commonModelSelect.value;const customModels=modelsInput.value.split(",").map((item)=>item.trim()).filter(Boolean);const models=commonModel?[commonModel,...customModels]:customModels;const defaultModel=commonModel||customModels[0]||modelSelect.value;const submitButton=configForm.querySelector("button[type='submit']");configError.textContent="";localStorage.setItem("dictionary-enabled",dictionaryToggleInput.checked?"1":"0");submitButton.disabled=true;submitButton.textContent="正在连接...";
-  try{const togglesChanged=[webSearchInput,visionInput,searchInput].some((box)=>box.checked!==(box.dataset.savedState==="1"));const modelOnly=!keyChanged&&!togglesChanged&&defaultModel&&baseUrl===baseUrlInput.dataset.savedValue;const payload=modelOnly?{model:defaultModel,models}:{base_url:baseUrl,models,default_model:defaultModel,web_search:webSearchInput.checked,vision_input:visionInput.checked,search_input:searchInput.checked};if(keyChanged&&apiKey)payload.api_key=apiKey;const response=await apiFetch(modelOnly?"/api/config/model":"/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||"配置保存失败");localStorage.setItem("chat-config",JSON.stringify({baseUrl,models}));if(defaultModel)localStorage.setItem("chat-model",defaultModel);await loadModels(defaultModel||null);await refreshVisionCapability();if(keyChanged)apiKeyDraft=apiKey;apiKeyInput.value=apiKeyDraft;return true}finally{apiKeyInput.type="password";apiKeyRevealButton.textContent="显示";submitButton.disabled=false;submitButton.textContent="保存并连接"}
+  try{const togglesChanged=[webSearchInput,visionInput,searchInput].some((box)=>box.checked!==(box.dataset.savedState==="1"))||searchTransportSelect.value!==searchTransportSelect.dataset.savedState;const modelOnly=!keyChanged&&!togglesChanged&&defaultModel&&baseUrl===baseUrlInput.dataset.savedValue;const payload=modelOnly?{model:defaultModel,models}:{base_url:baseUrl,models,default_model:defaultModel,web_search:webSearchInput.checked,vision_input:visionInput.checked,search_input:searchInput.checked,search_transport:searchTransportSelect.value};if(keyChanged&&apiKey)payload.api_key=apiKey;const response=await apiFetch(modelOnly?"/api/config/model":"/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||"配置保存失败");localStorage.setItem("chat-config",JSON.stringify({baseUrl,models}));if(defaultModel)localStorage.setItem("chat-model",defaultModel);await loadModels(defaultModel||null);await refreshVisionCapability();if(keyChanged)apiKeyDraft=apiKey;apiKeyInput.value=apiKeyDraft;return true}finally{apiKeyInput.type="password";apiKeyRevealButton.textContent="显示";submitButton.disabled=false;submitButton.textContent="保存并连接"}
 }
 
 async function toggleApiKeyVisibility(){
@@ -977,7 +998,7 @@ document.addEventListener("keydown",(event)=>{if(event.key==="Escape")closeDicti
 chatScroll.addEventListener("scroll",closeDictionaryCard,{passive:true});
 window.addEventListener("resize",closeDictionaryCard);
 
-modelSelect.addEventListener("change",()=>{persistSelectedModel(modelSelect.value).catch((error)=>setStatus(error.message,"error"))});
+modelSelect.addEventListener("change",()=>{persistSelectedModel(modelSelect.value).then(()=>refreshVisionCapability()).catch((error)=>setStatus(error.message,"error"))});
 composer.addEventListener("submit",(event)=>{event.preventDefault();sendMessage()});
 input.addEventListener("keydown",(event)=>{if(event.key==="Enter"&&!event.shiftKey&&!event.isComposing){event.preventDefault();sendMessage()}else if(event.key==="Escape"&&isGenerating)stopGeneration()});
 input.addEventListener("input",()=>{input.style.height="auto";input.style.height=Math.min(input.scrollHeight,180)+"px"});

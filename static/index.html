@@ -106,8 +106,9 @@
         </fieldset>
         <fieldset class="field-set">
           <legend>能力开关</legend>
-          <label class="field checkbox-field"><input id="web-search" type="checkbox"><span>允许 Claude 联网搜索（单条消息最多 3 次）<small>开启后模型可在回答前检索公开网页，提问内容会经由服务端搜索工具发出；搜索词与来源链接显示在回复下方。</small></span></label>
-          <label class="field checkbox-field"><input id="search-input" type="checkbox"><span>该模型支持联网搜索<small>中转站常把 Claude 改名成 gpt-pro-稳定 这类别名，此时自动识别会失效。勾选后即使模型名不含 claude 也会走原生搜索通道；若该模型其实不支持，服务会自动退回普通对话并提示，不会报错。</small></span></label>
+          <label class="field checkbox-field"><input id="web-search" type="checkbox"><span>允许模型联网搜索<small>开启后模型可在回答前检索公开网页，提问内容会经由上游的搜索工具发出；搜索词与来源链接显示在回复下方。Claude 最多搜 3 次，GPT 的次数由上游决定、本机无法限制。</small></span></label>
+          <label class="field"><span>联网搜索通道</span><select id="search-transport"><option value="">自动（按模型名判断）</option><option value="anthropic">Anthropic Messages（Claude 用）</option><option value="openai">OpenAI Responses（GPT 用）</option></select><small>默认按模型名自动选择：名字含 claude 走 Anthropic 的 /v1/messages，含 gpt 或 o 系列走 OpenAI 的 /v1/responses，两边都用你已填的这把 OpenAI 密钥，不需要额外映射。只有模型名被中转站改成别名、自动判断不到时才手动指定。</small><small id="search-transport-hint"></small></label>
+          <label class="field checkbox-field"><input id="search-input" type="checkbox"><span>该模型支持联网搜索<small>中转站常把模型改名成 gpt-pro-稳定 这类别名，此时自动识别会失效。勾选后即使模型名不含 claude 或 gpt 也会走 Anthropic 原生搜索通道；若该模型其实不支持，服务会自动退回普通对话并提示，不会报错。别名模型更建议用上面的“联网搜索通道”明确指定。</small></span></label>
           <label class="field checkbox-field"><input id="vision-input" type="checkbox"><span>允许图片输入<small>开启后可以给消息附一张图片（选图、粘贴或拖拽都可以），发送前会在浏览器里压到 1MB 以内并去掉照片自带的位置信息。常见多模态模型会自动识别，识别不到时再手动勾选。</small></span></label>
           <label class="field checkbox-field"><input id="dictionary-enabled" type="checkbox"><span>点击英文单词查释义<small>点击 AI 回复里的英文单词，显示本地词库的中文释义。词库来自开源项目 ECDICT，查询只发生在本机与本地服务之间。</small></span></label>
         </fieldset>

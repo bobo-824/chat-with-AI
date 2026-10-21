@@ -38,6 +38,48 @@ ANTHROPIC_SEARCH_EVENTS = [
 ]
 
 
+RESPONSES_SEARCH_EVENTS = [
+    {"type": "response.created", "response": {"id": "resp_search", "status": "in_progress"}},
+    {"type": "response.output_item.added", "output_index": 0, "item": {
+        "type": "web_search_call",
+        "id": "ws_1",
+        "status": "in_progress",
+        "action": {"type": "search", "queries": ["Shanghai date today"], "sources": []},
+    }},
+    {"type": "response.web_search_call.in_progress", "item_id": "ws_1", "output_index": 0},
+    {"type": "response.web_search_call.searching", "item_id": "ws_1", "output_index": 0},
+    {"type": "response.web_search_call.completed", "item_id": "ws_1", "output_index": 0, "item": {
+        "type": "web_search_call",
+        "id": "ws_1",
+        "status": "completed",
+        "action": {
+            "type": "search",
+            "queries": ["Shanghai date today"],
+            "sources": [
+                {"type": "url", "url": "https://time.is/Shanghai"},
+                {"type": "url", "url": "https://example.com/time"},
+            ],
+        },
+    }},
+    {"type": "response.output_item.added", "output_index": 1, "item": {"type": "message", "role": "assistant", "content": []}},
+    {"type": "response.output_text.delta", "item_id": "msg_1", "output_index": 1, "content_index": 0, "delta": "Today is "},
+    {"type": "response.output_text.delta", "item_id": "msg_1", "output_index": 1, "content_index": 0, "delta": "2026-10-20."},
+    {"type": "response.output_text.annotation.added", "item_id": "msg_1", "output_index": 1, "content_index": 0, "annotation_index": 0, "annotation": {
+        "type": "url_citation",
+        "url": "https://time.is/Shanghai",
+        "title": "relay-secret Time.is",
+        "start_index": 0,
+        "end_index": 9,
+    }},
+    {"type": "response.output_item.done", "output_index": 1, "item": {"type": "message", "role": "assistant", "content": [
+        {"type": "output_text", "text": "Today is 2026-10-20.", "annotations": []},
+    ]}},
+    {"type": "response.completed", "response": {"id": "resp_search", "status": "completed", "output": [
+        {"type": "web_search_call", "id": "ws_1", "action": {"type": "search", "queries": ["Shanghai date today"], "sources": [{"type": "url", "url": "https://time.is/Shanghai"}]}},
+    ]}},
+]
+
+
 WEB_SEARCH_DELTAS = [
     {"tool_calls": [{"index": 0, "id": "srvtoolu_1", "type": "function", "function": {"name": "web_search", "arguments": "{\"que"}}]},
     {"tool_calls": [{"index": 0, "function": {"arguments": "ry\": \"Shanghai date today\"}"}}]},
@@ -53,6 +95,8 @@ class MockRelayHandler(BaseHTTPRequestHandler):
     fail_chat = False
     search_reply = False
     native_search_reply = False
+    responses_search_reply = False
+    responses_unknown_tool_status = 0
 
     def do_GET(self):
         self.__class__.requests.append((self.command, self.path, self.headers.get("Authorization")))
@@ -70,6 +114,29 @@ class MockRelayHandler(BaseHTTPRequestHandler):
         self.__class__.requests.append(
             (self.command, self.path, self.headers.get("Authorization"), body, self.headers.get("x-api-key"))
         )
+        if self.path == "/v1/responses":
+            if not self.__class__.responses_search_reply:
+                self.send_json(404, {"error": {"type": "not_found_error", "message": "responses endpoint disabled"}})
+                return
+            request_body = json.loads(body) if body else {}
+            tool_types = [tool.get("type") for tool in request_body.get("tools") or []]
+            if self.__class__.responses_unknown_tool_status and "web_search" in tool_types:
+                self.send_json(
+                    self.__class__.responses_unknown_tool_status,
+                    {"error": {"type": "invalid_request_error", "message": "Unsupported tool type: web_search"}},
+                )
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            for event in RESPONSES_SEARCH_EVENTS:
+                frame = f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
+                self.wfile.write(frame.encode("utf-8"))
+            self.wfile.flush()
+            return
         if self.path == "/v1/messages":
             if not self.__class__.native_search_reply:
                 self.send_json(404, {"type": "error", "error": {"type": "not_found_error", "message": "messages endpoint disabled"}})
@@ -160,6 +227,8 @@ class RelayTestHarness(unittest.TestCase):
         MockRelayHandler.fail_chat = False
         MockRelayHandler.search_reply = False
         MockRelayHandler.native_search_reply = False
+        MockRelayHandler.responses_search_reply = False
+        MockRelayHandler.responses_unknown_tool_status = 0
         self.relay = ThreadingHTTPServer(("127.0.0.1", 0), MockRelayHandler)
         self.relay_thread = threading.Thread(target=self.relay.serve_forever, daemon=True)
         self.relay_thread.start()
@@ -807,6 +876,188 @@ class WebSearchRelayTest(RelayTestHarness):
         self.assertTrue(restarted.web_search_enabled)
 
 
+class ResponsesNativeSearchRelayTest(RelayTestHarness):
+    """A GPT model with web search enabled must use the native OpenAI Responses endpoint."""
+
+    GPT_MODEL = "gpt-5.6-codex"
+
+    def configure(self, web_search, model=GPT_MODEL, **extra):
+        payload = {
+            "api_key": "relay-secret",
+            "base_url": f"http://127.0.0.1:{self.relay.server_address[1]}/v1",
+            "models": [model],
+            "web_search": web_search,
+            **extra,
+        }
+        with self.request("/api/config", "POST", payload) as response:
+            self.assertEqual(response.status, 200)
+
+    def chat(self, model=GPT_MODEL):
+        with self.request(
+            "/api/chat",
+            "POST",
+            {"messages": [{"role": "user", "content": "What is today's date in Shanghai?"}], "model": model},
+        ) as response:
+            stream = response.read().decode("utf-8")
+        return [
+            json.loads(part[5:].strip())
+            for part in stream.split("\n\n")
+            if part.startswith("data:") and "[DONE]" not in part
+        ]
+
+    def relay_chat_bodies(self):
+        return [
+            json.loads(item[3])
+            for item in MockRelayHandler.requests
+            if item[0] == "POST" and item[1] == "/v1/chat/completions"
+        ]
+
+    def responses_bodies(self):
+        return [
+            json.loads(item[3])
+            for item in MockRelayHandler.requests
+            if item[0] == "POST" and item[1] == "/v1/responses"
+        ]
+
+    def responses_authorizations(self):
+        return [
+            item[2]
+            for item in MockRelayHandler.requests
+            if item[0] == "POST" and item[1] == "/v1/responses"
+        ]
+
+    def test_openai_declaration_matches_the_responses_contract(self):
+        declaration = server.web_search_tool_declaration_openai()
+        self.assertEqual(declaration["type"], "web_search")
+        self.assertNotIn("max_uses", declaration, "the Responses API has no max-uses cap")
+
+    def test_claude_and_gpt_resolve_to_different_channels(self):
+        self.assertEqual(server.search_transport_for("claude-opus-5-5"), "anthropic")
+        self.assertEqual(server.search_transport_for(self.GPT_MODEL), "openai")
+        self.assertIsNone(server.search_transport_for("wolf-pro-稳定"))
+
+    def test_search_on_gpt_uses_the_native_responses_endpoint(self):
+        self.configure(True)
+        MockRelayHandler.responses_search_reply = True
+        self.chat()
+        self.assertEqual(self.relay_chat_bodies(), [], "the native channel must replace the chat one")
+        body = self.responses_bodies()[0]
+        self.assertEqual(body["tools"], [server.web_search_tool_declaration_openai()])
+        self.assertTrue(body["stream"])
+        self.assertEqual(body["model"], self.GPT_MODEL)
+        self.assertEqual(body["input"], [{"role": "user", "content": "What is today's date in Shanghai?"}])
+
+    def test_gpt_channel_sends_the_openai_key_as_a_bearer_token(self):
+        """No key mapping: the same OpenAI key unlocks /v1/responses directly."""
+        self.configure(True)
+        MockRelayHandler.responses_search_reply = True
+        self.chat()
+        self.assertEqual(self.responses_authorizations(), ["Bearer relay-secret"])
+
+    def test_responses_stream_preserves_text_queries_and_citations(self):
+        self.configure(True)
+        MockRelayHandler.responses_search_reply = True
+        events = self.chat()
+        self.assertEqual("".join(event.get("content", "") for event in events), "Today is 2026-10-20.")
+        self.assertEqual(
+            [event["search"]["query"] for event in events if "search" in event],
+            ["Shanghai date today"],
+            "one query per search, not one per event",
+        )
+        self.assertEqual(
+            [source["url"] for event in events for source in event.get("sources", [])],
+            ["https://time.is/Shanghai", "https://example.com/time"],
+        )
+        self.assertEqual([event for event in events if "notice" in event], [])
+
+    def test_responses_search_persists_metadata_without_leaking_secrets(self):
+        self.configure(True)
+        MockRelayHandler.responses_search_reply = True
+        events = self.chat()
+        stream = json.dumps(events)
+        self.assertNotIn("relay-secret", stream)
+        conversations = server.Handler.chat_server.conversations.list_conversations()
+        history = server.Handler.chat_server.conversations.get_conversation(conversations[0]["id"])["messages"]
+        assistant = history[-1]
+        self.assertEqual(assistant["content"], "Today is 2026-10-20.")
+        self.assertEqual(assistant["search"], ["Shanghai date today"])
+        self.assertNotIn("relay-secret", json.dumps(history))
+
+    def test_missing_responses_endpoint_falls_back_without_breaking_chat(self):
+        self.configure(True)
+        MockRelayHandler.responses_search_reply = False
+        events = self.chat()
+        notices = [event["notice"] for event in events if "notice" in event]
+        self.assertEqual(len(notices), 1, notices)
+        self.assertIn("HTTP 404", notices[0])
+        self.assertEqual("".join(event.get("content", "") for event in events), "Hello from relay")
+        self.assertNotIn("tools", self.relay_chat_bodies()[0])
+
+    def test_rejected_tool_type_retries_once_with_the_dated_name(self):
+        self.configure(True)
+        MockRelayHandler.responses_search_reply = True
+        MockRelayHandler.responses_unknown_tool_status = 400
+        self.chat()
+        tool_types = [body["tools"][0]["type"] for body in self.responses_bodies()]
+        self.assertEqual(tool_types, ["web_search", "web_search_2025_08_26"])
+
+    def test_gpt_toggle_never_puts_tools_in_the_openai_chat_request(self):
+        self.configure(False)
+        MockRelayHandler.responses_search_reply = True
+        self.chat()
+        self.assertNotIn("tools", self.relay_chat_bodies()[0])
+        self.assertEqual(self.responses_bodies(), [])
+
+    def test_manual_channel_override_covers_an_aliased_model_name(self):
+        self.configure(True, model="wolf-pro-稳定", search_transport="openai")
+        MockRelayHandler.responses_search_reply = True
+        events = self.chat(model="wolf-pro-稳定")
+        self.assertEqual(len(self.responses_bodies()), 1)
+        self.assertEqual([event for event in events if "notice" in event], [])
+
+    def test_manual_channel_choice_is_persisted(self):
+        self.configure(True, model="wolf-pro-稳定", search_transport="openai")
+        restarted = server.ChatServer(app_password="", config_path=self.config_path)
+        self.assertEqual(restarted.search_transport, "openai")
+
+    def test_invalid_channel_is_rejected(self):
+        with self.assertRaises(HTTPError) as caught:
+            self.request(
+                "/api/config",
+                "POST",
+                {
+                    "api_key": "relay-secret",
+                    "base_url": f"http://127.0.0.1:{self.relay.server_address[1]}/v1",
+                    "models": [self.GPT_MODEL],
+                    "search_transport": "telnet",
+                },
+            )
+        self.assertEqual(caught.exception.code, 400)
+
+    def test_aliased_claude_name_still_uses_the_messages_endpoint(self):
+        """Claude aliases resolve by name to Messages; they must not drift onto Responses."""
+        self.configure(True, model="wolf-claude-别名")
+        MockRelayHandler.native_search_reply = True
+        MockRelayHandler.responses_search_reply = True
+        self.chat(model="wolf-claude-别名")
+        self.assertEqual(len(self.native_bodies()), 1)
+        self.assertEqual(self.responses_bodies(), [])
+
+    def test_search_input_alone_routes_an_unknown_model_to_anthropic(self):
+        self.configure(True, model="wolf-pro-稳定", search_input=True)
+        MockRelayHandler.native_search_reply = True
+        self.chat(model="wolf-pro-稳定")
+        self.assertEqual(len(self.native_bodies()), 1)
+        self.assertEqual(self.responses_bodies(), [])
+
+    def native_bodies(self):
+        return [
+            json.loads(item[3])
+            for item in MockRelayHandler.requests
+            if item[0] == "POST" and item[1] == "/v1/messages"
+        ]
+
+
 class OpenAIFormatSearchHarvestTest(RelayTestHarness):
     """A relay that surfaces search results in OpenAI-format chunks is still harvested."""
 
@@ -926,10 +1177,11 @@ class AnthropicStreamTranslationTest(unittest.TestCase):
         parsed = list(server.iter_anthropic_events(iter([": ping", "event: message_stop", "data: {broken", "data: [DONE]", ""])))
         self.assertEqual(parsed, [])
 
-    def test_only_claude_models_take_the_native_path(self):
-        self.assertTrue(server.model_supports_native_search("Claude-Opus-4-8"))
-        self.assertFalse(server.model_supports_native_search("gpt-5.6-sol"))
-        self.assertFalse(server.model_supports_native_search(""))
+    def test_only_search_capable_models_take_a_native_path(self):
+        self.assertEqual(server.search_transport_for("Claude-Opus-4-8"), "anthropic")
+        self.assertEqual(server.search_transport_for("gpt-5.6-sol"), "openai")
+        self.assertIsNone(server.search_transport_for(""))
+        self.assertIsNone(server.search_transport_for("gpt-pro-稳定 2x"), "an aliased Claude is not an OpenAI model")
 
 if __name__ == "__main__":
     unittest.main()
